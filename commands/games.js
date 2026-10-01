@@ -3,20 +3,12 @@ const { resolveUser, pick, randInt, shuffle, awaitReply, confirm } = require('..
 const { card, color, ansiBlock } = require('../lib/format');
 const dm = require('../lib/dm');
 const { busy, betOrUsage } = require('../lib/bets');
+const partyArt = require('../lib/party-art');
 
-// One channel-wide game at a time per GC (trivia, hangman, ttt, guess).
-const activeGames = new Map(); // channelId -> game name
-
-function claimChannel(message, game) {
-  const current = activeGames.get(message.channel.id);
-  if (current) {
-    message.reply(`A game of **${current}** is already running here.`);
-    return false;
-  }
-  activeGames.set(message.channel.id, game);
-  return true;
-}
-const releaseChannel = (message) => activeGames.delete(message.channel.id);
+// One channel-wide game at a time per GC (trivia, hangman, ttt, guess, connect 4, and the party games).
+const party = require('../lib/party');
+const claimChannel = (message, game) => party.claimChannel(message, game);
+const releaseChannel = (message) => party.releaseChannel(message.channel);
 
 const HANGMAN_WORDS = [
   'pizza', 'discord', 'javascript', 'deed', 'banana', 'keyboard', 'penguin', 'volcano', 'galaxy', 'pancake',
@@ -30,6 +22,38 @@ const TTT_LINES = [[0, 1, 2], [3, 4, 5], [6, 7, 8], [0, 3, 6], [1, 4, 7], [2, 5,
 const TTT_CELLS = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣'];
 const tttBoard = (b) => [0, 3, 6].map((i) => b.slice(i, i + 3).map((c, j) => c ?? TTT_CELLS[i + j]).join('')).join('\n');
 const tttWinner = (b) => TTT_LINES.find(([x, y, z]) => b[x] && b[x] === b[y] && b[x] === b[z]);
+
+// ---------- Connect 4 ----------
+const C4_ROWS = 6, C4_COLS = 7;
+const C4_DISCS = ['🔴', '🟡'];
+const C4_MOVE_MS = Number(process.env.C4_MOVE_MS || 60000);
+// Drop a disc in column c (0-based). Returns the row it landed in, or -1 if the column is full.
+function c4Drop(grid, c, who) {
+  for (let r = C4_ROWS - 1; r >= 0; r--) if (grid[r][c] === null) { grid[r][c] = who; return r; }
+  return -1;
+}
+// Four in a row through (r, c)? Returns the winning cells or null.
+function c4Win(grid, r, c) {
+  const who = grid[r][c];
+  for (const [dr, dc] of [[0, 1], [1, 0], [1, 1], [1, -1]]) {
+    const cells = [[r, c]];
+    for (const s of [1, -1]) {
+      for (let k = 1; k < 4; k++) {
+        const rr = r + dr * k * s, cc = c + dc * k * s;
+        if (rr < 0 || rr >= C4_ROWS || cc < 0 || cc >= C4_COLS || grid[rr][cc] !== who) break;
+        cells.push([rr, cc]);
+      }
+    }
+    if (cells.length >= 4) return cells;
+  }
+  return null;
+}
+const c4Text = (grid) => `${grid.map((row) => row.map((v) => (v === null ? '⚫' : C4_DISCS[v])).join('')).join('\n')}\n1️⃣2️⃣3️⃣4️⃣5️⃣6️⃣7️⃣`;
+async function c4Send(channel, grid, content, opts) {
+  let buffer = null;
+  try { buffer = await partyArt.connect4Board({ grid, ...opts }); } catch (err) { console.error('[connect4 art]', err.message); }
+  return channel.send(buffer ? { content, files: [{ attachment: buffer, name: 'connect4.png' }] } : `${content}\n${c4Text(grid)}`);
+}
 
 
 // ---------- Rock paper scissors (PvP over DMs) ----------
@@ -395,4 +419,62 @@ module.exports = [
       }
     },
   },
+  {
+    name: 'connect4',
+    aliases: ['c4', 'connectfour'],
+    usage: 'connect4 <@user> [bet]',
+    description: 'Connect 4 against someone in the GC. Type 1–7 to drop a disc. Four in a row wins.',
+    async run({ client, message, args }) {
+      const p1 = message.author;
+      const p2 = await resolveUser(client, message, args[0]);
+      if (!p2 || p2.id === p1.id) return message.reply('Challenge who? `connect4 @user [bet]`');
+      if (p2.id === client.user.id) return message.reply("I'd win every time. Challenge a friend. 😌");
+      const bet = args[1] ? eco.parseBet(p1.id, args[1]) : 0;
+      if (args[1] && !bet) return message.reply("Invalid bet (or you don't have that much).");
+      if (bet && eco.balance(p2.id) < bet) return message.reply(`${p2.username} can't cover that bet.`);
+      if (!claimChannel(message, 'Connect 4')) return;
+
+      try {
+        await message.channel.send(card({
+          title: 'Connect 4 challenge', emoji: '🔴',
+          body: [`**${p1.username}** vs **${p2.username}**`, bet ? `Stakes: **🪙 ${bet.toLocaleString()}** each` : null],
+          footer: `${p2.username}: type accept or decline (30s)`,
+        }));
+        if (!(await confirm(message.channel, p2))) return message.channel.send(`${p2.username} declined.`);
+        if (bet && (eco.balance(p1.id) < bet || eco.balance(p2.id) < bet)) return message.channel.send('Someone no longer has enough coins.');
+        if (bet) { eco.take(p1.id, bet); eco.take(p2.id, bet); }
+
+        const grid = Array.from({ length: C4_ROWS }, () => Array(C4_COLS).fill(null));
+        const players = shuffle([p1, p2]);
+        const names = players.map((u) => u.username);
+        const payout = (winner, loser) => {
+          if (!bet) return '';
+          eco.settle(winner.id, bet, bet * 2); eco.settle(loser.id, bet, 0);
+          return ` +${eco.fmt(bet)}`;
+        };
+        let last = null;
+        for (let turn = 0; ; turn++) {
+          const who = turn % 2;
+          const cur = players[who], other = players[1 - who];
+          await c4Send(message.channel, grid, `### ${C4_DISCS[who]} ${cur.username}'s turn\n-# type 1–7 · ${Math.round(C4_MOVE_MS / 1000)}s`, { last, names });
+          const m = await awaitReply(message.channel, (x) => x.author.id === cur.id && /^[1-7]$/.test(x.content.trim()) && grid[0][Number(x.content) - 1] === null, C4_MOVE_MS);
+          if (!m) return message.channel.send(`⌛ ${cur.username} took too long. **${other.username}** wins!${payout(other, cur)}`);
+          const c = Number(m.content) - 1;
+          const r = c4Drop(grid, c, who);
+          last = [r, c];
+          const win = c4Win(grid, r, c);
+          if (win) return c4Send(message.channel, grid, `### 🏆 ${C4_DISCS[who]} ${cur.username} connects four!${payout(cur, other)}`, { win, names });
+          if (grid[0].every((v) => v !== null)) {
+            if (bet) { eco.settle(p1.id, bet, bet); eco.settle(p2.id, bet, bet); }
+            return c4Send(message.channel, grid, "### 🤝 The board is full. It's a draw!", { names });
+          }
+        }
+      } finally {
+        releaseChannel(message);
+      }
+    },
+  },
 ];
+
+module.exports.push(require('../lib/games/wordle'));
+module.exports.connect4 = { c4Drop, c4Win };

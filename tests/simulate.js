@@ -1,6 +1,7 @@
 // Offline simulator: runs Deed's commands against a fake group chat, no Discord login needed.
 //   npm test            -> run every scenario, print what Deed would send
 //   npm test -- quiet   -> only print failures and the summary
+//   npm test -- only=party  -> just setup + the party games / mystery extras (much faster)
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
@@ -20,6 +21,8 @@ process.env.MM_READY_MS = '3000';
 process.env.MM_DAY_MS = '300';
 process.env.MM_VOTE_MS = '3000';
 process.env.MM_NIGHT_MS = '3000';
+process.env.PARTY_LOBBY_MS = '4000';
+process.env.PARTY_READY_MS = '3000';
 process.env.GROUP_IDS = '';
 process.env.ADMIN_IDS = '';
 process.env.DEED_DB = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'deed-test-')), 'db.json');
@@ -30,6 +33,7 @@ const eco = require('../lib/economy');
 const reminders = require('../lib/reminders');
 
 const QUIET = process.argv.includes('quiet');
+const ONLY = process.argv.find((a) => a.startsWith('only='))?.slice(5) ?? null;
 let idSeq = 1000;
 // Real Discord IDs are bigger than JS numbers can hold exactly, so build them as strings.
 const nextId = () => `1${String(idSeq++).padStart(17, '0')}`;
@@ -223,6 +227,7 @@ async function main() {
   check('setup explains ownership (already owner)', /GC owner/.test(r));
   r = await say(bob, '!setup');
   check('setup twice is a no-op', /already active/.test(r));
+  if (ONLY === 'party') { await runPartyTests(); return summary(); }
 
   // Alice tries to activate a second GC -> refused.
   const gc2 = { ...channel, id: 'gc-2', name: 'other gc', recipients: new Collection([[alice.id, alice]]) };
@@ -1307,10 +1312,42 @@ async function main() {
   r = await say(alice, '!np');
   check('np with nothing playing', /Nothing is playing/.test(r));
 
-  // ---------- summary ----------
+  await runPartyTests();
+  summary();
+}
+
+function summary() {
   console.log(`\n${'━'.repeat(40)}\n✅ ${passed} passed${failures.length ? `   ❌ ${failures.length} failed` : ''}`);
   for (const f of failures) console.log(`  ❌ ${f}`);
   process.exit(failures.length ? 1 : 0);
+}
+
+// Party games (tests/party.js) get the same fake GC, plus a DM helper.
+const partyDMs = []; // { to, content }
+const dmChannels = new Map();
+function dmChannelFor(user) {
+  if (!dmChannels.has(user.id)) {
+    dmChannels.set(user.id, {
+      type: 'DM',
+      async send(c) {
+        const content = typeof c === 'object' ? `[file ${c.files?.[0]?.name} ${c.files?.[0]?.attachment?.length ?? 0}B]${c.content ? ` ${c.content}` : ''}` : c;
+        partyDMs.push({ to: user, content });
+        out(content, 'dm');
+      },
+    });
+  }
+  return dmChannels.get(user.id);
+}
+async function runPartyTests() {
+  const dmRouter = require('../lib/dm');
+  const dmTo = async (user, content) => {
+    if (!QUIET) console.log(`\n✉️  ${user.username} → Deed (DM): ${content}`);
+    await dmRouter.route(client, { id: nextId(), content, author: user, channel: dmChannelFor(user) });
+    await settle();
+  };
+  const dmsFor = (u) => partyDMs.filter((d) => d.to === u).map((d) => d.content);
+  const gcFind = (re) => [...log].reverse().find((m) => re.test(m.content))?.content ?? '';
+  await require('./party')({ say, dmTo, dmsFor, gcFind, check, until, settle, last, log, channel, client, eco, users: { me, alice, bob, carol, dave, frank, gina: erinLike }, QUIET });
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });

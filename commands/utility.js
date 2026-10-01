@@ -6,13 +6,13 @@ const { resolveUser, parseDuration, formatDuration } = require('../lib/util');
 const { card, color, rows, ansiBlock } = require('../lib/format');
 const { WebEmbed, enabled: webEmbeds } = require('../lib/webembed');
 
-const CATEGORY_ORDER = ['setup', 'utility', 'gc', 'economy', 'earn', 'jobs', 'fishing', 'casino', 'stake', 'crypto', 'chain', 'games',
+const CATEGORY_ORDER = ['setup', 'utility', 'gc', 'economy', 'earn', 'jobs', 'fishing', 'casino', 'stake', 'crypto', 'chain', 'games', 'party',
   'mystery', 'marriage', 'roleplay', 'images', 'lookup', 'tools', 'music', 'stream'];
 const clipText = (t, n) => (t.length > n ? `${t.slice(0, n - 1)}…` : t);
 
 const CATEGORY_LABELS = {
   setup: '🚀 Setup', utility: '🛠️ Utility', gc: '👥 Group chat', economy: '💰 Economy', earn: '💸 Earning',
-  casino: '🎰 Casino', stake: '💎 Stake Originals', games: '🎮 Games', music: '🎵 Music', lookup: '📚 Lookup', tools: '🧰 Tools', roleplay: '🎭 Roleplay', fishing: '🎣 Fishing & shop', jobs: '💼 Jobs', marriage: '💍 Marriage', images: '🖼️ Images', stream: '📺 Streaming', crypto: '📈 Crypto', chain: '🔗 Blockchain', mystery: '🔪 Murder Mystery',
+  casino: '🎰 Casino', stake: '💎 Stake Originals', games: '🎮 Games', music: '🎵 Music', lookup: '📚 Lookup', tools: '🧰 Tools', roleplay: '🎭 Roleplay', fishing: '🎣 Fishing & shop', jobs: '💼 Jobs', marriage: '💍 Marriage', images: '🖼️ Images', stream: '📺 Streaming', crypto: '📈 Crypto', chain: '🔗 Blockchain', mystery: '🔪 Murder Mystery', party: '🎉 Party games',
 };
 
 function timeIn(tz) {

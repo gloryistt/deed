@@ -865,6 +865,8 @@ async function main() {
     await until(() => /is dead/.test(gcFind(/is dead/)), 3000);
     check('mm: victim dies with chosen weapon', !victim.alive && /iron fireplace poker/.test(gcFind(/is dead/)), gcFind(/is dead/));
     check('mm: last will read on death', /Last will of .+except the butler/.test(gcFind(/is dead/)), gcFind(/is dead/));
+    const longWill = { will: 'x '.repeat(80).trim() };
+    check('mm: will excerpt for scene cards', /^Will: “.+except the butler”$/.test(mm.willExcerpt(victim)) && mm.willExcerpt(longWill).length < 75 && mm.willExcerpt(longWill).endsWith('…”') && /torn/.test(mm.willExcerpt(victim, true)) && mm.willExcerpt({}) === null, mm.willExcerpt(victim));
     check('mm: detective fooled by the frame', /SUSPICIOUS/.test(dmsFor(detective.user).find((c) => /Dawn report/.test(c)) ?? ''));
     const frameClue = g.clues[1];
     check('mm: framed clue points away from the killer', frameClue && !frameClue.options.includes(killer.traits[frameClue.category][0]) && frameClue.options.includes(framed.traits[frameClue.category][0]), JSON.stringify(frameClue));

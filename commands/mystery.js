@@ -62,6 +62,14 @@ function willLines(p, burned = false) {
   if (!p.will) return [];
   return [`> 📜 **Last will of ${p.char.name}:** *${p.will}*`];
 }
+// A short quote of the will for the scene card (the full text is in the message).
+const WILL_EXCERPT = 60;
+function willExcerpt(p, burned = false) {
+  if (!p.will) return null;
+  if (burned) return 'Their will was torn to shreds';
+  const cut = p.will.length <= WILL_EXCERPT ? p.will : `${p.will.slice(0, WILL_EXCERPT).replace(/\s+\S*$/, '')}…`;
+  return `Will: “${cut}”`;
+}
 const voteWeight = (p) => (p.role === 'mayor' ? (p.revealed ? 3 : 2) : 1);
 
 function numbered(g, filter = () => true) {
@@ -482,7 +490,8 @@ async function nightPhase(g) {
     roleColor: dead ? ROLE_COLORS[dead.role] : null,
     lines: kind === 'saved'
       ? [`Attacked in the ${room}`, 'but someone got there just in time']
-      : kind === 'hero' ? [`Took the blow meant for ${victim.char.name}`, `in the ${room}`] : [`Found in the ${room}`, weapon[1]],
+      : kind === 'hero' ? [`Took the blow meant for ${victim.char.name}`, `in the ${room}`, willExcerpt(dead)].filter(Boolean)
+        : [`Found in the ${room}`, weapon[1], willExcerpt(dead, n.clean)].filter(Boolean),
     avatarUrl: avatarOf(shown),
     footer: `${alive(g).length} guests remain`,
   }), `night-${g.day}.png`);
@@ -619,7 +628,7 @@ async function trialPhase(g, accused) {
   return sayWithArt(g, lines.join('\n'), () => art.sceneCard({
     kind: 'guilty', headline: `Day ${g.day} · The trial`, name: accused.char.name, subtitle: `@${accused.user.username} · ${accused.char.title}`,
     role: accused.role === 'jester' ? 'Jester · wins!' : r.name, roleColor: ROLE_COLORS[accused.role],
-    lines: [`Convicted ${guilty} to ${innocent}`, isMurderTeam(accused) ? 'caught red-handed' : 'an innocent guest…'], avatarUrl: avatarOf(accused),
+    lines: [`Convicted ${guilty} to ${innocent}`, isMurderTeam(accused) ? 'caught red-handed' : 'an innocent guest…', willExcerpt(accused)].filter(Boolean), avatarUrl: avatarOf(accused),
   }), `trial-${g.day}.png`);
 }
 
@@ -890,4 +899,4 @@ module.exports = [
   })),
 ];
 
-module.exports.internals = { games, playerGame, assignRoles, roleList, makeClue, winner, stats, runGame };
+module.exports.internals = { games, playerGame, assignRoles, roleList, makeClue, winner, stats, runGame, willExcerpt };

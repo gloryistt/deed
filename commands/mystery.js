@@ -14,7 +14,7 @@ const art = require('../lib/mystery-art');
 
 const ROLE_COLORS = {
   murderer: '#e0253a', accomplice: '#fb923c', detective: '#60a5fa', doctor: '#34d399',
-  bodyguard: '#93c5fd', mayor: '#c4b5fd', jester: '#f472b6', guest: '#cbd5e1',
+  bodyguard: '#93c5fd', witness: '#fde68a', mayor: '#c4b5fd', jester: '#f472b6', guest: '#cbd5e1',
 };
 const avatarOf = (p) => p.user.displayAvatarURL?.({ format: 'png', dynamic: false, size: 256 });
 
@@ -52,6 +52,17 @@ const say = (g, text) => g.channel.send(text).catch(() => {});
 const secs = (ms) => `${Math.round(ms / 1000)}s`;
 const team = (p) => ROLES[p.role].team;
 const isMurderTeam = (p) => team(p) === 'murderers';
+// MVP points for things that actually helped your side (kills, saves, catches, good votes).
+const award = (p, pts) => { if (p) p.points = (p.points ?? 0) + pts; };
+const WILL_MAX = 300;
+// Player-written text gets posted by the bot, so defuse mass pings and keep it inside the quote block.
+const sanitize = (text) => String(text).replace(/@(everyone|here)/gi, '@\u200b$1').replace(/<@&/g, '<@\u200b&').replace(/\s*\n\s*/g, ' / ').trim();
+function willLines(p, burned = false) {
+  if (burned) return [`> 📜 ${p.char.name}’s will was found torn to shreds.`];
+  if (!p.will) return [];
+  return [`> 📜 **Last will of ${p.char.name}:** *${p.will}*`];
+}
+const voteWeight = (p) => (p.role === 'mayor' ? (p.revealed ? 3 : 2) : 1);
 
 function numbered(g, filter = () => true) {
   return alive(g).filter(filter).map((p, i) => `\`${i + 1}\` ${plain(p)}`).join('\n');
@@ -82,7 +93,7 @@ const poke = (g) => { if (g.waiter?.pred()) g.waiter.done(); };
 function guestList(g) {
   return g.players.map((p) => {
     const t = p.traits;
-    const status = p.alive ? '' : ` · ☠️ ${ROLES[p.role].emoji} ${ROLES[p.role].name}`;
+    const status = p.alive ? (p.revealed ? ' · 🎩 **Mayor**' : '') : ` · ☠️ ${ROLES[p.role].emoji} ${ROLES[p.role].name}`;
     return `> ${p.alive ? '🎭' : '⚰️'} ${label(p)}, ${p.char.title}${status}\n> -# ${t.garment[0]} · ${t.scent[0]} · ${t.mark[0]}`;
   }).join('\n');
 }
@@ -144,7 +155,7 @@ function roleCard(g, p) {
     `> ${r.goal}`,
     partners.length ? `> 🤝 Your side: ${partners.map((x) => `${label(x)} (${ROLES[x.role].name})`).join(', ')}` : null,
     `> ${r.how}`,
-    `-# ${g.setting.emoji} ${g.setting.name} · keep this secret · DM me \`role\` anytime`,
+    `-# ${g.setting.emoji} ${g.setting.name} · keep this secret · DM me \`role\` anytime · \`will <text>\` to leave a last will`,
   ].filter(Boolean).join('\n');
 }
 
@@ -167,6 +178,7 @@ const TARGET_FILTERS = {
   inspect: (p) => (x) => x.id !== p.id,
   protect: (p) => (x) => x.id !== p.lastProtect,
   guard: (p) => (x) => x.id !== p.id,
+  watch: (p) => (x) => x.id !== p.id,
 };
 
 function nightPrompt(g, p) {
@@ -194,7 +206,31 @@ dm.onDM(async (client, message) => {
     return true;
   }
   if (/^role$/i.test(text)) { await reply(roleCard(g, p)); return true; }
-  if (!p.alive) { await reply('👻 You’re dead. Haunt the chat, but no spoilers!'); return true; }
+
+  // Last will: revealed when you die. Murderers can write a fake one.
+  const willMatch = /^will\b\s*([\s\S]*)$/i.exec(text);
+  if (willMatch) {
+    if (!p.alive) { await reply('📜 Too late for that. Your will was read when you died.'); return true; }
+    const body = sanitize(willMatch[1]);
+    if (!body) { await reply(p.will ? `### 📜 Your will\n> *${p.will}*\n-# \`will <text>\` to rewrite it` : '📜 Reply `will <text>` to write a last will. It’s read out if you die.'); return true; }
+    p.will = body.slice(0, WILL_MAX);
+    await reply(`### 📜 Will saved\n> *${p.will}*${body.length > WILL_MAX ? `\n-# trimmed to ${WILL_MAX} characters` : ''}\n-# it’s read out if you die · rewrite it anytime`);
+    return true;
+  }
+
+  if (!p.alive) {
+    // Ghosts get one anonymous haunt during the day, so dead players still have a say.
+    const haunt = /^haunt\s+(.+)$/i.exec(text);
+    if (!haunt) { await reply(p.haunted ? '👻 You’re dead, and you’ve already used your haunt. No spoilers!' : '👻 You’re dead. During the day you can `haunt <#>` once: the chat sees an anonymous ghost pointing at that guest.'); return true; }
+    if (p.haunted) { await reply('👻 You already used your haunt this game.'); return true; }
+    if (g.phase !== 'day' && g.phase !== 'vote') { await reply('👻 Ghosts can only haunt during the day.'); return true; }
+    const target = findTarget(g, haunt[1]);
+    if (!target) { await reply(`👻 Reply \`haunt <number or name>\`:\n${numbered(g)}`); return true; }
+    p.haunted = true;
+    await reply(`👻 You drift toward ${label(target)}…`);
+    await say(g, `### 👻 The candles gutter\n> A cold hand settles on ${label(target)}’s shoulder. One of the dead is pointing at them.\n-# ghosts can be from either side`);
+    return true;
+  }
 
   const action = ROLES[p.role].night;
   if (g.phase !== 'night' || !action) {
@@ -256,7 +292,12 @@ dm.onDM(async (client, message) => {
   } else if (action === 'inspect') {
     n.inspects.set(p.id, target.id);
     await reply(`### 🔍 You investigate ${label(target)}\n-# your findings arrive at dawn`);
+  } else if (action === 'watch') {
+    n.watches.set(p.id, target.id);
+    await reply(`### 👁️ You keep an eye on ${label(target)}’s door\n-# your report arrives at dawn`);
   }
+  // Everyone acting tonight leaves their room (the witness sees this). Only the latest choice counts.
+  if (action !== 'kill') n.visits.set(p.id, target.id);
   n.acted.add(p.id);
   poke(g);
   return true;
@@ -282,9 +323,10 @@ async function readyPhase(g) {
   if (missing.length) await say(g, `-# left out (no DM): ${missing.map((p) => p.user.username).join(', ')}`);
 }
 
-// Role mix scales with the lobby.
+// Role mix scales with the lobby. The murder team stays around a fifth to a quarter of the table,
+// since clues, searches and the info roles give the guests a lot to work with.
 function roleList(n) {
-  const murderers = n >= 19 ? 3 : n >= 13 ? 2 : 1;
+  const murderers = n >= 17 ? 3 : n >= 11 ? 2 : 1;
   const roles = Array(murderers).fill('murderer');
   if (n >= 7) roles.push('accomplice');
   roles.push('detective');
@@ -292,6 +334,7 @@ function roleList(n) {
   if (n >= 5) roles.push('doctor');
   if (n >= 6) roles.push('jester');
   if (n >= 8) roles.push('mayor');
+  if (n >= 9) roles.push('witness');
   if (n >= 10) roles.push('bodyguard');
   while (roles.length < n) roles.push('guest');
   return roles;
@@ -332,7 +375,7 @@ async function prologue(g) {
 async function nightPhase(g) {
   g.day++;
   g.phase = 'night';
-  g.night = { kill: null, killer: null, weapon: null, protects: new Set(), guards: new Map(), frames: new Set(), frameClue: null, clean: false, inspects: new Map(), acted: new Set() };
+  g.night = { kill: null, killer: null, weapon: null, protects: new Set(), guards: new Map(), frames: new Set(), frameClue: null, clean: false, inspects: new Map(), watches: new Map(), visits: new Map(), acted: new Set() };
   const s = g.setting;
   await say(g, `### 🌙 Night ${g.day}\n> *${pick(s.night)}*\n> Everyone returns to their rooms. Those with a night role: check your DMs.\n-# night ends in ${secs(T.night())} or when everyone has acted`);
 
@@ -350,6 +393,7 @@ async function nightPhase(g) {
   for (const [detId, targetId] of n.inspects) {
     const det = byId(g, detId), target = byId(g, targetId);
     const suspicious = target.role === 'murderer' || n.frames.has(target.id);
+    if (target.role === 'murderer') award(det, 2);
     det.dmChannel?.send(`### 🔍 Dawn report: ${label(target)} looks ${suspicious ? '**SUSPICIOUS** 🔪' : '**innocent** 😇'}\n-# framed people look suspicious, and the accomplice looks innocent`).catch(() => {});
   }
 
@@ -358,10 +402,23 @@ async function nightPhase(g) {
   let victim = n.kill ? byId(g, n.kill) : null;
   if (!victim?.alive) victim = pick(alive(g).filter((p) => !isMurderTeam(p)));
   const killer = byId(g, n.killer) ?? pick(murderers);
+  n.visits.set(killer.id, victim.id);
   const weapon = n.weapon ?? pick(WEAPONS);
   const room = pick(s.rooms);
   g.lastRoom = room;
-  const event = process.env.MM_EVENTS === 'off' ? null : EVENTS.find((e) => Math.random() < e.chance);
+
+  // Witness reports: who left their room, and where they went. Frames don't matter here.
+  for (const [witId, targetId] of n.watches) {
+    const wit = byId(g, witId), target = byId(g, targetId);
+    const went = n.visits.has(target.id) ? byId(g, n.visits.get(target.id)) : null;
+    if (went && isMurderTeam(target)) award(wit, 2);
+    wit.dmChannel?.send(went
+      ? `### 👁️ Dawn report: ${label(target)} **left their room** in the night\n> You saw them slip into ${label(went)}’s room.\n-# every night role moves around, not only killers`
+      : `### 👁️ Dawn report: ${label(target)} **never left their room**`).catch(() => {});
+  }
+
+  const events = EVENTS.filter((e) => alive(g).length >= (e.min ?? 0));
+  const event = process.env.MM_EVENTS === 'off' ? null : events.find((e) => Math.random() < e.chance);
   const noClues = n.clean || event?.id === 'outage';
   const bodyguard = [...n.guards].find(([, t]) => t === victim.id)?.[0];
 
@@ -371,12 +428,17 @@ async function nightPhase(g) {
   if (bodyguard && byId(g, bodyguard).alive) {
     dead = byId(g, bodyguard);
     dead.alive = false;
+    stats(killer.id).kills++;
+    killer.kills = (killer.kills ?? 0) + 1;
+    award(killer, 3);
+    award(dead, 3);
     lines.push(`### 🛡️ ${dead.char.name} died a hero`, `> ${label(dead)} threw themselves in front of ${label(victim)} in the **${room}** and was ${weapon[1]}.`,
-      `> They were the **Bodyguard** 🛡️. With their last breath they saw something…`);
+      `> They were the **Bodyguard** 🛡️. With their last breath they saw something…`, ...willLines(dead));
     const c = makeClue(g, { culprit: killer, anchor: killer, options: 2 });
     lines.push('', clueText(c));
     g.events.push(`Night ${g.day}: ${plain(dead)} (Bodyguard) died protecting ${plain(victim)} from ${plain(killer)}.`);
   } else if (n.protects.has(victim.id)) {
+    for (const doc of alive(g).filter((x) => x.role === 'doctor' && n.visits.get(x.id) === victim.id)) award(doc, 3);
     lines.push('### 💉 A close call', `> ${label(victim)} was attacked in the **${room}**, but someone got there just in time. They’re shaken, but alive.`);
     if (!noClues) lines.push('', clueText(makeClue(g, { culprit: killer, anchor: n.frameClue ? byId(g, n.frameClue) : null })));
     g.events.push(`Night ${g.day}: ${plain(victim)} was attacked by ${plain(killer)}, but the Doctor saved them.`);
@@ -385,8 +447,9 @@ async function nightPhase(g) {
     victim.alive = false;
     stats(killer.id).kills++;
     killer.kills = (killer.kills ?? 0) + 1;
+    award(killer, 3);
     lines.push(`### ⚰️ ${victim.char.name} is dead`, `> ${label(victim)} is found in the **${room}**, ${weapon[1]}.`,
-      `> They were the **${ROLES[victim.role].name}** ${ROLES[victim.role].emoji}.`);
+      `> They were the **${ROLES[victim.role].name}** ${ROLES[victim.role].emoji}.`, ...willLines(victim, n.clean && !!victim.will));
     g.events.push(`Night ${g.day}: ${plain(victim)} (${ROLES[victim.role].name}) was ${weapon[1]} in the ${room} by ${plain(killer)}${n.clean ? ' (cleaned up)' : ''}${n.frameClue ? `, framing ${plain(byId(g, n.frameClue))}` : ''}.`);
     if (!noClues) {
       const clueCount = g.players.length >= 6 ? 2 : 1;
@@ -399,6 +462,14 @@ async function nightPhase(g) {
   }
   if (event?.id === 'seance' && dead) lines.push(clueText(makeClue(g, { culprit: killer, truth: 0.85, options: 2, intro: `👻 ${dead.char.name}’s ghost whispers that the killer:` })));
   if (event?.id === 'dog') lines.push(clueText(makeClue(g, { culprit: killer, truth: 0.6, options: 2, intro: `🐕 The dog was barking at someone who:` })));
+  if (event?.id === 'diary') {
+    const cleared = pick(alive(g).filter((p) => !isMurderTeam(p) && !p.cleared));
+    if (cleared) {
+      cleared.cleared = true;
+      lines.push(`> 📖 *“${cleared.char.name} could never hurt a soul.”* ${label(cleared)} is **not** a killer.`);
+      g.events.push(`Night ${g.day}: a diary page cleared ${plain(cleared)}.`);
+    }
+  }
 
   const shown = dead ?? victim;
   const kind = !dead ? 'saved' : dead.role === 'bodyguard' && dead !== victim ? 'hero' : 'dead';
@@ -420,13 +491,15 @@ async function nightPhase(g) {
 async function dayPhase(g) {
   g.phase = 'day';
   g.skip = false;
+  g.searched = new Map(); // room -> player who searched it today
   const ms = T.day(alive(g).length);
   await say(g, card({
     title: `Day ${g.day} · Investigation`, emoji: '☀️',
     body: [
       'Cross-check the clues against the guests’ traits. Accuse, defend, lie.',
-      `🔍 Everyone alive can **\`mm search <room>\`** once today. Rooms: ${g.setting.rooms.join(', ')}.`,
-      g.lastRoom ? `-# last night’s scene: the ${g.lastRoom}` : null,
+      `🔍 Everyone alive can **\`mm search <room>\`** once today, and each room can only be searched once. Rooms: ${g.setting.rooms.join(', ')}.`,
+      g.lastRoom ? `-# last night’s scene: the ${g.lastRoom} (best odds of evidence)` : null,
+      '-# 🎩 a Mayor can `mm reveal` · 👻 the dead can DM me `haunt <#>` once',
     ],
     footer: `accusations open in ${secs(ms)} · host can \`mm skip\` · ${alive(g).length} alive · \`mm clues\``,
   }));
@@ -460,7 +533,7 @@ function trialBoard(g, closed = false) {
   const { accused, votes } = g.trial;
   let guilty = 0, innocent = 0;
   for (const [id, v] of votes) {
-    const w = byId(g, id).role === 'mayor' ? 2 : 1;
+    const w = voteWeight(byId(g, id));
     if (v === 'guilty') guilty += w; else innocent += w;
   }
   return {
@@ -522,7 +595,11 @@ async function trialPhase(g, accused) {
   }
   accused.alive = false;
   const r = ROLES[accused.role];
-  for (const [id, v] of g.trial.votes) if (v === 'guilty' && isMurderTeam(accused)) { const voter = byId(g, id); voter.goodVotes = (voter.goodVotes ?? 0) + 1; }
+  // Voting right helps your side: guilty on the murder team for guests, guilty on an innocent for the murder team.
+  for (const [id, v] of g.trial.votes) {
+    const voter = byId(g, id);
+    if (v === 'guilty' && isMurderTeam(accused) !== isMurderTeam(voter)) award(voter, 2);
+  }
   if (isMurderTeam(accused)) stats(accused.id); // make sure an entry exists
   for (const [id, v] of g.trial.votes) if (v === 'guilty' && accused.role === 'murderer') stats(id).convictions++;
   g.events.push(`Day ${g.day}: ${plain(accused)} was convicted ${guilty}–${innocent}. They were the ${r.name}.`);
@@ -530,9 +607,11 @@ async function trialPhase(g, accused) {
     `### ⛓️ ${accused.char.name} is found guilty`,
     `> The door to the cellar slams shut. As they’re dragged away, the truth comes out…`,
     `> ${label(accused)} was ${accused.role === 'murderer' ? '**a MURDERER!** 🔪' : accused.role === 'accomplice' ? '**the ACCOMPLICE!** 🤝' : `the **${r.name}** ${r.emoji}. Innocent.`}`,
+    ...willLines(accused),
   ];
   if (accused.role === 'jester') {
     g.jesterWinner = accused;
+    award(accused, 5);
     lines.push('', '> 🃏 **…and they’re laughing.** The Jester wanted this. **The Jester wins!**');
   }
   const heir = promoteAccomplice(g);
@@ -548,7 +627,7 @@ async function finale(g, side) {
   g.phase = 'over';
   const winners = g.players.filter((p) => (side === 'town' ? team(p) === 'town' : team(p) === 'murderers'));
   if (g.jesterWinner) winners.push(g.jesterWinner);
-  const score = (p) => (p.kills ?? 0) * 3 + (p.goodVotes ?? 0) * 2 + (p.alive ? 1 : 0);
+  const score = (p) => (p.points ?? 0) + (p.alive ? 1 : 0);
   const mvp = [...winners].sort((a, b) => score(b) - score(a))[0];
   for (const p of g.players) {
     const s = stats(p.id);
@@ -615,17 +694,28 @@ async function runGame(g) {
 }
 
 // ---------------------------------------------------------------- day actions
+const NOTHING = ['dust and old letters', 'a mouse, which is now very upset', 'nothing but cobwebs', 'a half-eaten sandwich (not evidence)', 'a creaky floorboard and nothing else'];
+
 function search(g, p, roomText) {
-  const room = g.setting.rooms.find((r) => r.toLowerCase().includes(roomText.toLowerCase())) ?? null;
+  const t = roomText.trim().toLowerCase();
+  const room = t ? g.setting.rooms.find((r) => r.toLowerCase().includes(t)) ?? null : null;
   if (!room) return { error: `Search where? Rooms: ${g.setting.rooms.join(', ')}` };
+  g.searched ??= new Map();
+  const by = g.searched.get(room);
+  if (by) return { error: `The ${room} was already searched today by ${by.char.name}. Try another room.` };
+  g.searched.set(room, p);
+  const hot = room === g.lastRoom;
+  // The murder team "finds nothing": they pocket or wipe whatever was there.
+  if (isMurderTeam(p)) {
+    if (hot) g.events.push(`Day ${g.day}: ${plain(p)} (${ROLES[p.role].name}) searched the crime scene and destroyed the evidence.`);
+    return { nothing: pick(NOTHING) };
+  }
   const culprit = pick(alive(g).filter((x) => x.role === 'murderer')) ?? pick(g.players.filter((x) => x.role === 'murderer'));
-  const hot = room === g.lastRoom && !g.sceneSearched;
-  if (hot) g.sceneSearched = true;
   if (Math.random() < (hot ? 0.75 : 0.35) && culprit) {
     const clue = makeClue(g, { culprit, truth: hot ? 0.7 : 0.55, options: 2, intro: `In the ${room}, ${p.char.name} finds evidence that the killer:` });
     return { clue };
   }
-  return { nothing: pick(['dust and old letters', 'a mouse, which is now very upset', 'nothing but cobwebs', 'a half-eaten sandwich (not evidence)', 'a creaky floorboard and nothing else']) };
+  return { nothing: pick(NOTHING) };
 }
 
 function castVerdict(g, message, verdict) {
@@ -660,7 +750,7 @@ module.exports = [
   {
     name: 'mystery',
     aliases: ['mm', 'murder', 'murdermystery'],
-    usage: 'mm [join | leave | start | stop | skip | search <room> | clues | guests | roles | stats]',
+    usage: 'mm [join | leave | start | stop | skip | search <room> | reveal | clues | guests | roles | stats]',
     description: 'Murder mystery: secret roles by DM, murders, clues, searches, trials (4–25 players).',
     async run({ client, message, args, config }) {
       const p = config.prefix;
@@ -679,7 +769,7 @@ module.exports = [
         }));
       }
       if (sub === 'roles') {
-        return ch.send(`### 🎭 Roles\n${Object.values(ROLES).map((r) => `> ${r.emoji} **${r.name}**: ${r.goal}`).join('\n')}\n-# 4: 🔪🔍 · 5: +💉 · 6: +🃏 · 7: +🤝 · 8: +🎩 · 10: +🛡️ · 13+: more murderers & detectives`);
+        return ch.send(`### 🎭 Roles\n${Object.values(ROLES).map((r) => `> ${r.emoji} **${r.name}**: ${r.goal}`).join('\n')}\n-# 4: 🔪🔍 · 5: +💉 · 6: +🃏 · 7: +🤝 · 8: +🎩 · 9: +👁️ · 10: +🛡️ · 11: 2nd 🔪 · 15: 2nd 🔍 · 17: 3rd 🔪\n-# everyone: DM me \`will <text>\` for a last will · the dead can \`haunt <#>\` once`);
       }
 
       if (!g) {
@@ -741,6 +831,17 @@ module.exports = [
         player.searchedDay = g.day;
         return ch.send(result.clue ? `### 🔍 ${player.char.name} found something!\n${clueText(result.clue)}` : `### 🔍 ${player.char.name} searched\n> …and found ${result.nothing}.`);
       }
+      if (sub === 'reveal') {
+        const player = byId(g, me.id);
+        if (!player?.alive) return message.reply('Only living players can do that.');
+        if (!['day', 'vote', 'defense', 'trial'].includes(g.phase)) return message.reply('You can only reveal during the day.');
+        if (player.role !== 'mayor') return message.reply('🎩 You have nothing to reveal… or do you?');
+        if (player.revealed) return message.reply('Everyone already knows. 🎩');
+        player.revealed = true;
+        g.events.push(`Day ${g.day}: ${plain(player)} revealed themselves as the Mayor.`);
+        if (g.phase === 'trial') g.trialMsg?.edit(trialBoard(g).text).catch(() => {});
+        return ch.send(`### 🎩 ${player.char.name} is the Mayor!\n> ${label(player)} stands on a chair and produces the deed to the house. Their verdict at trials now counts **triple**.\n-# …and the killer knows exactly who they are now`);
+      }
       if (sub === 'clues') {
         if (!g.clues.length) return message.reply('No clues yet.');
         return ch.send(`### 🔎 Clues so far\n${g.clues.map((c) => `> ${clueText(c).replace('🔎 ', '')}`).join('\n')}\n-# if a clue is true, one of its traits belongs to a killer`);
@@ -789,4 +890,4 @@ module.exports = [
   })),
 ];
 
-module.exports.internals = { games, playerGame, assignRoles, roleList, makeClue, winner, stats };
+module.exports.internals = { games, playerGame, assignRoles, roleList, makeClue, winner, stats, runGame };

@@ -824,6 +824,8 @@ async function main() {
     check('mm roles: 6p adds doctor + jester', mix(6).includes('doctor') && mix(6).includes('jester'));
     check('mm roles: 7p adds accomplice', mix(7).includes('accomplice'));
     check('mm roles: 10p has mayor + bodyguard', mix(10).includes('mayor') && mix(10).includes('bodyguard'));
+    check('mm roles: 9p adds witness', mix(9).includes('witness') && !mix(8).includes('witness'));
+    check('mm roles: 11p has 2 murderers + accomplice', mix(11).filter((r) => r === 'murderer').length === 2 && mix(11).includes('accomplice'));
     check('mm roles: 25p = 3 murderers, 2 detectives', mix(25).filter((r) => r === 'murderer').length === 3 && mix(25).filter((r) => r === 'detective').length === 2);
 
     r = await say(alice, '!mm');
@@ -849,6 +851,8 @@ async function main() {
     await until(() => g.phase === 'night', 3000);
     check('mm: night 1 before the first vote', g.phase === 'night' && g.day === 1 && !/Accusations|Who should stand trial/.test(gcFind(/stand trial/)));
     check('mm: murderer night prompt has frame/clean/weapons', dmsFor(killer.user).some((c) => /Night 1/.test(c) && /frame/.test(c) && /clean/.test(c)));
+    await dmTo(victim.user, 'will I trust @everyone except the butler');
+    check('mm: will saved (mass pings defused)', /Will saved/.test(dmsFor(victim.user).at(-1)) && !/@everyone/.test(victim.will), dmsFor(victim.user).at(-1));
     await dmTo(killer.user, 'kill 999');
     check('mm: bad target gets the list', /Reply `kill/.test(dmsFor(killer.user).at(-1)));
     await dmTo(killer.user, `frame ${framed.user.username}`);
@@ -860,6 +864,7 @@ async function main() {
     check('mm: weapon choice', /fireplace poker/.test(dmsFor(killer.user).at(-1)), dmsFor(killer.user).at(-1));
     await until(() => /is dead/.test(gcFind(/is dead/)), 3000);
     check('mm: victim dies with chosen weapon', !victim.alive && /iron fireplace poker/.test(gcFind(/is dead/)), gcFind(/is dead/));
+    check('mm: last will read on death', /Last will of .+except the butler/.test(gcFind(/is dead/)), gcFind(/is dead/));
     check('mm: detective fooled by the frame', /SUSPICIOUS/.test(dmsFor(detective.user).find((c) => /Dawn report/.test(c)) ?? ''));
     const frameClue = g.clues[1];
     check('mm: framed clue points away from the killer', frameClue && !frameClue.options.includes(killer.traits[frameClue.category][0]) && frameClue.options.includes(framed.traits[frameClue.category][0]), JSON.stringify(frameClue));
@@ -870,8 +875,21 @@ async function main() {
     check('mm: search works', /searched|found something/.test(r), r);
     r = await say(detective.user, `!mm search ${g.setting.rooms[1]}`);
     check('mm: one search per day', /already searched/.test(r), r);
+    r = await say(framed.user, `!mm search ${g.setting.rooms[0]}`);
+    check('mm: each room once per day', /already searched today by/.test(r), r);
+    r = await say(framed.user, '!mm search');
+    check('mm: search needs a room', /Search where/.test(r), r);
+    const cluesBefore = g.clues.length;
+    r = await say(killer.user, `!mm search ${g.lastRoom === g.setting.rooms[0] ? g.setting.rooms[2] : g.lastRoom}`);
+    check('mm: murder team searches find nothing', /searched\n> …and found/.test(r) && g.clues.length === cluesBefore, r);
     r = await say(victim.user, '!mm search library');
     check('mm: dead cannot search', /Only living/.test(r), r);
+    r = await say(framed.user, '!mm reveal');
+    check('mm: only the mayor can reveal', /nothing to reveal/.test(r), r);
+    await dmTo(victim.user, `haunt ${killer.user.username}`);
+    check('mm: ghost haunt posts anonymously', /One of the dead is pointing at them/.test(gcFind(/candles gutter/)) && !gcFind(/candles gutter/).includes(victim.user.username), gcFind(/candles gutter/));
+    await dmTo(victim.user, `haunt ${framed.user.username}`);
+    check('mm: one haunt per game', /already used your haunt/.test(dmsFor(victim.user).at(-1)), dmsFor(victim.user).at(-1));
     await until(() => g.phase === 'vote', 3000);
     for (const p of g.players.filter((x) => x.alive && x !== killer)) await say(p.user, `!vote ${killer.user.username}`);
     await say(killer.user, `!vote ${framed.user.username}`);

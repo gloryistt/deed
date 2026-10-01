@@ -1,7 +1,7 @@
 // Party game scenarios, run by tests/simulate.js (which supplies the fake GC + DM helpers).
 module.exports = async function partyTests(h) {
   const { say, dmTo, dmsFor, gcFind, check, until, settle, eco, users } = h;
-  const { alice, bob, carol, dave } = users;
+  const { me, alice, bob, carol, dave, frank, gina } = users;
   const party = require('../lib/party');
   const lastDM = (u) => dmsFor(u).at(-1) ?? '';
 
@@ -346,5 +346,112 @@ module.exports = async function partyTests(h) {
     for (const g of ['crane', 'slate', 'pious', 'nymph', 'blitz', 'gawky'].filter((x) => x !== w.answerFor(101)).slice(0, 6)) await dmTo(alice, `wordle ${g}`);
     check('wordle: six misses ends the game and shows the word', /The word was/.test(lastDM(alice)) || /Got it/.test(lastDM(alice)), lastDM(alice));
     delete process.env.WORDLE_DAY;
+  }
+
+  console.log('\n━━━ Murder mystery: new roles & features ━━━');
+  {
+    const mm = require('../commands/mystery').internals;
+    const saved = { ...process.env };
+    Object.assign(process.env, { MM_DEFENSE_MS: '200', MM_TRIAL_MS: '3000', MM_EVENTS: 'off', MM_DAY_MS: '8000', MM_VOTE_MS: '3000', MM_NIGHT_MS: '3000', MM_QUESTION_MS: '2000', MM_READY_MS: '3000' });
+    const roles14 = mm.roleList(14);
+    check('mm: 11–14 players add survivor, executioner, vigilante, medium', ['survivor', 'executioner', 'vigilante', 'medium'].every((r) => roles14.includes(r)) && roles14.length === 14 && !mm.roleList(10).includes('survivor'));
+    const chaos = mm.roleList(10, 'chaos');
+    check('mm: chaos mode keeps the table size and never doubles a special', chaos.length === 10 && ['survivor', 'executioner', 'vigilante', 'medium'].every((r) => chaos.filter((x) => x === r).length <= 1));
+
+    // Game A: executioner, vigilante vs vest, lovers, bets, interrogation, board, achievements.
+    const six = [alice, bob, carol, dave, frank, gina];
+    for (const u of six) eco.add(u.id, 1000);
+    await say(alice, '!mm');
+    for (const u of six.slice(1)) await say(u, '!mm join');
+    const g = mm.games.get(h.channel.id);
+    let r = await say(carol, '!spyfall');
+    check('mm: party games blocked while a mystery runs here', /already running|already in a game of \*\*Murder Mystery/.test(r), r);
+    r = await say(me, '!spyfall');
+    check('mm: …even for people not in it', /already running/.test(r), r);
+    g.forceRoles = ['murderer', 'executioner', 'vigilante', 'medium', 'survivor', 'guest'];
+    g.forceLovers = [dave.id, gina.id];
+    g.forceExeTarget = carol.id;
+    r = await say(alice, '!mm start chaos');
+    check('mm: start with a mode', /Chaos mode/.test(r) && g.mode === 'chaos', r);
+    for (const u of six) await dmTo(u, 'ready');
+    await until(() => g.phase === 'night', 5000);
+    const roleDM = (u) => dmsFor(u).filter((c) => /You are the/.test(c)).at(-1) ?? '';
+    check('mm: executioner told their target', /Your target: \*\*.+\*\* \(carol\)/.test(roleDM(bob)), roleDM(bob));
+    check('mm: lovers told about each other', /in love with .+\(gina\)/.test(roleDM(dave)) && /in love with .+\(dave\)/.test(roleDM(gina)));
+    check('mm: survivor starts with 2 vests', /2 left/.test(roleDM(frank)), roleDM(frank));
+    await dmTo(frank, 'vest');
+    check('mm: survivor vest', /Vest on/.test(lastDM(frank)), lastDM(frank));
+    await dmTo(carol, `shoot ${frank.username}`);
+    check('mm: vigilante takes aim', /take aim/.test(lastDM(carol)), lastDM(carol));
+    await dmTo(alice, `kill ${gina.username}`);
+    await until(() => g.phase === 'day', 5000);
+    const morning = gcFind(/is dead/);
+    check('mm: lover dies of a broken heart', !g.players.find((p) => p.id === dave.id).alive && /broken heart/.test(morning), morning.slice(0, 300));
+    check('mm: vest stops the vigilante', g.players.find((p) => p.id === frank.id).alive && /but they survived/.test(morning));
+
+    r = await say(bob, '!mm bet alice 100');
+    check('mm: living players cannot bet', /Only the dead and spectators/.test(r), r);
+    const gina0 = eco.balance(gina.id);
+    r = await say(gina, '!mm bet alice 100');
+    check('mm: ghosts can bet', /bets 🪙 100/.test(r) && /3\.2×/.test(r), r);
+    r = await say(bob, `!mm question ${frank.username}`);
+    check('mm: interrogation asks a question', /Interrogation/.test(r), r);
+    r = await say(frank, 'I was asleep, obviously');
+    check('mm: interrogation answer quoted', /🗣️ \*\*.+:\*\* “I was asleep, obviously”/.test(r), r);
+    r = await say(carol, '!mm question bob');
+    check('mm: one interrogation per day', /already been interrogated/.test(r), r);
+    r = await say(alice, '!mm board');
+    await until(() => /evidence-board\.png/.test(gcFind(/evidence-board/)), 8000);
+    check('mm: evidence board image', /\[file evidence-board\.png \d{4,}B\]/.test(gcFind(/evidence-board/)), gcFind(/Evidence board/).slice(0, 80));
+    await say(alice, '!mm skip');
+    await until(() => g.phase === 'vote', 3000);
+    for (const u of [alice, bob, frank]) await say(u, `!vote ${carol.username}`);
+    await say(carol, '!vote skip');
+    await until(() => g.phase === 'trial', 4000);
+    for (const u of [alice, bob, frank]) await say(u, 'guilty');
+    await until(() => /Executioner wins/.test(gcFind(/found guilty/)), 5000);
+    check('mm: executioner wins when their target is convicted', /Executioner wins/.test(gcFind(/found guilty/)), gcFind(/found guilty/).slice(0, 200));
+    await until(() => g.phase === 'night', 5000);
+    await dmTo(alice, `kill ${frank.username}`);
+    await until(() => /murderers win/.test(gcFind(/murderers win/)), 6000);
+    const fin = gcFind(/murderers win/);
+    check('mm: executioner listed as a co-winner', /Executioner also wins/.test(fin), fin.slice(0, 300));
+    check('mm: bets settled at the end', /gina\*\* bet 🪙 100 on .+: won 🪙 320/.test(fin) && eco.balance(gina.id) === gina0 + 220 + 50, `${eco.balance(gina.id) - gina0}`); // +50 for playing
+    check('mm: achievements unlocked', /Hanging Judge/.test(fin) && mm.stats(bob.id).achievements.includes('hanging_judge'), fin.split('Achievements')[1]?.slice(0, 200));
+    await until(() => !mm.games.has(h.channel.id) && !party.channelGame(h.channel), 3000);
+    check('mm: locks released after the game', !party.playingIn(alice.id) && !party.channelGame(h.channel));
+    r = await say(alice, '!mm top');
+    check('mm: leaderboard', /Mystery leaderboard/.test(r) && /alice/.test(r), r);
+    r = await say(bob, '!mm stats');
+    check('mm: stats show achievements', /Hanging Judge/.test(r), r);
+
+    // Game B: quick mode, medium talks to the dead, spectator bet refunded when the host stops the game.
+    const four = [alice, bob, carol, dave];
+    await say(alice, '!mm');
+    for (const u of four.slice(1)) await say(u, '!mm join');
+    const g2 = mm.games.get(h.channel.id);
+    r = await say(alice, '!mm mode quick');
+    check('mm: mode set in the lobby', /Mode set to \*\*quick/.test(r) && g2.mode === 'quick', r);
+    g2.forceRoles = ['murderer', 'medium', 'guest', 'guest'];
+    await say(alice, '!mm start');
+    for (const u of four) await dmTo(u, 'ready');
+    await until(() => g2.phase === 'night', 5000);
+    await dmTo(alice, `kill ${carol.username}`);
+    await until(() => g2.phase === 'day', 5000);
+    const frank0 = eco.balance(frank.id);
+    r = await say(frank, '!mm bet alice 50');
+    check('mm: spectators can bet', /bets 🪙 50/.test(r) && eco.balance(frank.id) === frank0 - 50, r);
+    await say(alice, '!mm skip');
+    await until(() => g2.phase === 'vote', 3000);
+    for (const u of [alice, bob, dave]) await say(u, '!vote skip');
+    await until(() => g2.phase === 'night', 5000);
+    await dmTo(bob, 'who did this to you?');
+    check('mm: medium reaches the dead', /A medium reaches across:\*\* who did this to you\?/.test(lastDM(carol)), lastDM(carol));
+    await dmTo(carol, 'it was alice!!');
+    check('mm: the dead answer the medium', /👻 \*\*.+\*\* \(carol, Guest\): it was alice!!/.test(lastDM(bob)), lastDM(bob));
+    await say(alice, '!mm stop');
+    await until(() => !mm.games.has(h.channel.id), 3000);
+    check('mm: unsettled bets refunded when stopped', eco.balance(frank.id) === frank0, `${eco.balance(frank.id) - frank0}`);
+    Object.assign(process.env, saved);
   }
 };

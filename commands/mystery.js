@@ -7,7 +7,8 @@ const eco = require('../lib/economy');
 const dm = require('../lib/dm');
 const onboarding = require('../lib/onboarding');
 const { data, save } = require('../lib/db');
-const { SETTINGS, CHARACTERS, TRAITS, WEAPONS, ROLES, CLUE_INTROS, EVENTS, DEFAULT_WEAPON } = require('../lib/mystery-data');
+const party = require('../lib/party');
+const { SETTINGS, CHARACTERS, TRAITS, WEAPONS, ROLES, CLUE_INTROS, EVENTS, QUESTIONS } = require('../lib/mystery-data');
 const { pick, shuffle, resolveUser, awaitReply } = require('../lib/util');
 const { card, color, ansiBlock } = require('../lib/format');
 const art = require('../lib/mystery-art');
@@ -15,7 +16,9 @@ const art = require('../lib/mystery-art');
 const ROLE_COLORS = {
   murderer: '#e0253a', accomplice: '#fb923c', detective: '#60a5fa', doctor: '#34d399',
   bodyguard: '#93c5fd', witness: '#fde68a', mayor: '#c4b5fd', jester: '#f472b6', guest: '#cbd5e1',
+  vigilante: '#a3a3a3', medium: '#a78bfa', survivor: '#86efac', executioner: '#94a3b8',
 };
+const NAME = 'Murder Mystery'; // for the shared party-game locks (one game per GC / per player)
 const avatarOf = (p) => p.user.displayAvatarURL?.({ format: 'png', dynamic: false, size: 256 });
 
 // Post text with a generated image attached; if rendering fails, post the text alone.
@@ -34,7 +37,16 @@ const T = {
   trial: () => env('MM_TRIAL_MS', 25000),
   night: () => env('MM_NIGHT_MS', 70000),
   min: () => env('MM_MIN_PLAYERS', 4),
+  question: () => env('MM_QUESTION_MS', 30000),
 };
+// Game modes: quick shortens every timer; chaos adds special roles, lovers and more night events.
+const MODES = {
+  classic: { emoji: '🎭', blurb: 'the standard game' },
+  quick: { emoji: '⚡', blurb: 'shorter timers' },
+  chaos: { emoji: '🌀', blurb: 'extra special roles, lovers, and more night events' },
+};
+const pace = (g, ms) => Math.round(ms * (g.mode === 'quick' ? 0.6 : 1));
+const BET_MAX = 5000;
 const MAX_PLAYERS = 25;
 const WIN_REWARD = 300;
 const MVP_BONUS = 150;
@@ -52,6 +64,7 @@ const say = (g, text) => g.channel.send(text).catch(() => {});
 const secs = (ms) => `${Math.round(ms / 1000)}s`;
 const team = (p) => ROLES[p.role].team;
 const isMurderTeam = (p) => team(p) === 'murderers';
+const startedOnMurderTeam = (p) => ROLES[p.startRole].team === 'murderers';
 // MVP points for things that actually helped your side (kills, saves, catches, good votes).
 const award = (p, pts) => { if (p) p.points = (p.points ?? 0) + pts; };
 const WILL_MAX = 300;
@@ -139,6 +152,32 @@ function winner(g) {
   return null;
 }
 
+// After any death: lovers follow each other, an Executioner whose target died some other way becomes a
+// Jester, and if every murderer is gone an accomplice takes over the knife. Adds lines to `lines`.
+function aftermath(g, lines) {
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const p of g.players) {
+      const lover = p.lover ? byId(g, p.lover) : null;
+      if (p.alive || !lover?.alive) continue;
+      lover.alive = false;
+      changed = true;
+      lines.push(`> 💔 **${lover.char.name}** couldn’t live without ${p.char.name} and died of a broken heart. They were the **${ROLES[lover.role].name}** ${ROLES[lover.role].emoji}.`, ...willLines(lover));
+      g.events.push(`Day ${g.day}: ${plain(lover)} (${ROLES[lover.role].name}) died of a broken heart after losing ${plain(p)}.`);
+    }
+  }
+  for (const exe of alive(g).filter((x) => x.role === 'executioner' && !x.exeWon)) {
+    const target = byId(g, exe.exeTarget);
+    if (target && !target.alive) {
+      exe.role = 'jester';
+      exe.dmChannel?.send(`## 🃏 Your target is dead
+> ${target.char.name} died before you could get them convicted. **You are now the Jester:** win by getting yourself voted guilty.`).catch(() => {});
+    }
+  }
+  const heir = promoteAccomplice(g);
+  if (heir) lines.push('', '> 🔪 *Somewhere in the house, someone picks up the knife…* (the killing isn’t over)');
+}
+
 // If every murderer is gone but an accomplice lives, they take over the knife.
 function promoteAccomplice(g) {
   if (alive(g).some((p) => p.role === 'murderer')) return null;
@@ -162,21 +201,31 @@ function roleCard(g, p) {
     `> -# you ${verb(p.traits.garment[0])} · ${verb(p.traits.scent[0])} · ${verb(p.traits.mark[0])}`,
     `> ${r.goal}`,
     partners.length ? `> 🤝 Your side: ${partners.map((x) => `${label(x)} (${ROLES[x.role].name})`).join(', ')}` : null,
-    `> ${r.how}`,
+    p.exeTarget && p.role === 'executioner' ? `> 🎯 Your target: ${label(byId(g, p.exeTarget))}` : null,
+    p.lover ? `> 💘 You’re in love with ${label(byId(g, p.lover))}. If one of you dies, so does the other. You still play for your own side.` : null,
+    `> ${r.how}${p.role === 'survivor' ? ` (${p.vests ?? 0} left)` : ''}`,
     `-# ${g.setting.emoji} ${g.setting.name} · keep this secret · DM me \`role\` anytime · \`will <text>\` to leave a last will`,
   ].filter(Boolean).join('\n');
 }
 
 function stats(userId) {
   data.mmStats ??= {};
-  return (data.mmStats[userId] ??= { games: 0, wins: 0, kills: 0, murderer: 0, convictions: 0 });
+  const s = (data.mmStats[userId] ??= { games: 0, wins: 0, kills: 0, murderer: 0, convictions: 0 });
+  s.achievements ??= [];
+  return s;
 }
 
 function cleanup(g) {
   g.phase = 'over';
   if (g.waiter) g.waiter.done();
   games.delete(g.channel.id);
-  for (const p of g.players) if (playerGame.get(p.id) === g) playerGame.delete(p.id);
+  if (party.channelGame(g.channel) === NAME) party.releaseChannel(g.channel);
+  for (const p of g.players) {
+    if (playerGame.get(p.id) === g) playerGame.delete(p.id);
+    party.unlockPlayer(p.id, NAME);
+  }
+  // Bets that never got settled (game stopped or crashed) are refunded.
+  for (const [id, b] of g.bets ?? []) if (!b.settled) { eco.settle(id, b.amount, b.amount); b.settled = true; }
 }
 
 // ---------------------------------------------------------------- DMs (roles, night actions)
@@ -187,13 +236,16 @@ const TARGET_FILTERS = {
   protect: (p) => (x) => x.id !== p.lastProtect,
   guard: (p) => (x) => x.id !== p.id,
   watch: (p) => (x) => x.id !== p.id,
+  shoot: (p) => (x) => x.id !== p.id,
 };
+// Who the night waits for. A Vigilante who already fired has nothing left to do.
+const nightAction = (p) => (p.role === 'vigilante' && p.usedShot ? null : ROLES[p.role].night);
 
 function nightPrompt(g, p) {
   const action = ROLES[p.role].night;
   const extras = p.role === 'murderer'
     ? `\n-# also: ${p.usedFrame ? '~~frame~~ (used)' : '`frame <#>`'} · ${p.usedClean ? '~~clean~~ (used)' : '`clean`'} · weapons: ${WEAPONS.map((w) => w[0].split(' ').pop()).join(', ')}`
-    : p.role === 'accomplice' ? '\n-# or `skip`' : '';
+    : p.role === 'accomplice' || p.role === 'vigilante' ? '\n-# or `skip`' : '';
   return `### ${ROLES[p.role].emoji} Night ${g.day}\n> Reply \`${action} <number or name>\`:\n${numbered(g, TARGET_FILTERS[action](p)).split('\n').map((l) => `> ${l}`).join('\n')}${extras}`;
 }
 
@@ -226,6 +278,23 @@ dm.onDM(async (client, message) => {
     return true;
   }
 
+  // The Medium talks with the dead at night: their DMs go to every ghost, and the ghosts' replies come back.
+  if (g.phase === 'night') {
+    const mediums = alive(g).filter((x) => x.role === 'medium');
+    if (p.alive && p.role === 'medium') {
+      const ghosts = g.players.filter((x) => !x.alive);
+      if (!ghosts.length) { await reply('🔮 You reach out… but there are no spirits here yet.'); return true; }
+      for (const gh of ghosts) gh.dmChannel?.send(`🔮 **A medium reaches across:** ${sanitize(text).slice(0, 300)}\n-# reply tonight and they’ll hear you`).catch(() => {});
+      await reply(`🔮 Your words reach the other side (${ghosts.length} spirit${ghosts.length === 1 ? '' : 's'}).`);
+      return true;
+    }
+    if (!p.alive && mediums.length && !/^haunt\s/i.test(text)) {
+      for (const md of mediums) md.dmChannel?.send(`👻 **${p.char.name}** (${p.user.username}, ${ROLES[p.role].name}): ${sanitize(text).slice(0, 300)}`).catch(() => {});
+      await reply('👻 Your words drift to the medium…');
+      return true;
+    }
+  }
+
   if (!p.alive) {
     // Ghosts get one anonymous haunt during the day, so dead players still have a say.
     const haunt = /^haunt\s+(.+)$/i.exec(text);
@@ -240,9 +309,20 @@ dm.onDM(async (client, message) => {
     return true;
   }
 
-  const action = ROLES[p.role].night;
+  // Survivor: put on a vest for the night.
+  if (p.role === 'survivor' && /^vest$/i.test(text)) {
+    if (g.phase !== 'night') { await reply('🦺 Vests go on at night.'); return true; }
+    if (g.night.vests.has(p.id)) { await reply('🦺 You’re already wearing one tonight.'); return true; }
+    if (!p.vests) { await reply('🦺 You’re out of vests. Good luck.'); return true; }
+    p.vests--;
+    g.night.vests.add(p.id);
+    await reply(`### 🦺 Vest on\n> You’ll survive one attack tonight. ${p.vests} left.`);
+    return true;
+  }
+
+  const action = nightAction(p);
   if (g.phase !== 'night' || !action) {
-    await reply(g.phase === 'night' ? '🌙 You have no night action. Sleep with one eye open…' : '☀️ It’s daytime. Discuss, search and vote in the group chat.\n-# DM me `role` to see your role');
+    await reply(g.phase === 'night' ? (p.role === 'survivor' ? '🌙 DM me `vest` to wear a vest tonight.' : p.role === 'vigilante' ? '🔫 You’ve used your bullet. Sleep tight.' : '🌙 You have no night action. Sleep with one eye open…') : '☀️ It’s daytime. Discuss, search and vote in the group chat.\n-# DM me `role` to see your role');
     return true;
   }
   const n = g.night;
@@ -266,9 +346,11 @@ dm.onDM(async (client, message) => {
     await reply(`### 🎭 Framing ${label(target)}\n> Tonight’s clues will point at them, and the detective will see them as suspicious.`);
     return true;
   }
-  if (p.role === 'accomplice' && lower === 'skip') {
+  if ((p.role === 'accomplice' || p.role === 'vigilante') && lower === 'skip') {
     n.acted.add(p.id);
-    await reply('🤝 You lie low tonight.');
+    n.shots.delete(p.id);
+    n.visits.delete(p.id);
+    await reply(p.role === 'vigilante' ? '🔫 You keep your bullet for another night.' : '🤝 You lie low tonight.');
     poke(g);
     return true;
   }
@@ -303,6 +385,9 @@ dm.onDM(async (client, message) => {
   } else if (action === 'watch') {
     n.watches.set(p.id, target.id);
     await reply(`### 👁️ You keep an eye on ${label(target)}’s door\n-# your report arrives at dawn`);
+  } else if (action === 'shoot') {
+    n.shots.set(p.id, target.id);
+    await reply(`### 🔫 You take aim at ${label(target)}\n-# you only get one bullet · \`skip\` to change your mind before dawn`);
   }
   // Everyone acting tonight leaves their room (the witness sees this). Only the latest choice counts.
   if (action !== 'kill') n.visits.set(p.id, target.id);
@@ -326,14 +411,14 @@ async function readyPhase(g) {
   }));
   await waitFor(g, () => g.players.every((p) => p.ready), T.ready());
   const missing = g.players.filter((p) => !p.ready);
-  for (const p of missing) playerGame.delete(p.id);
+  for (const p of missing) { playerGame.delete(p.id); party.unlockPlayer(p.id, NAME); }
   g.players = g.players.filter((p) => p.ready);
   if (missing.length) await say(g, `-# left out (no DM): ${missing.map((p) => p.user.username).join(', ')}`);
 }
 
 // Role mix scales with the lobby. The murder team stays around a fifth to a quarter of the table,
 // since clues, searches and the info roles give the guests a lot to work with.
-function roleList(n) {
+function roleList(n, mode = 'classic') {
   const murderers = n >= 17 ? 3 : n >= 11 ? 2 : 1;
   const roles = Array(murderers).fill('murderer');
   if (n >= 7) roles.push('accomplice');
@@ -344,12 +429,24 @@ function roleList(n) {
   if (n >= 8) roles.push('mayor');
   if (n >= 9) roles.push('witness');
   if (n >= 10) roles.push('bodyguard');
+  if (n >= 11) roles.push('survivor');
+  if (n >= 12) roles.push('executioner');
+  if (n >= 13) roles.push('vigilante');
+  if (n >= 14) roles.push('medium');
   while (roles.length < n) roles.push('guest');
+  // Chaos: about half the plain guests get a special role instead.
+  if (mode === 'chaos') {
+    const specials = ['survivor', 'executioner', 'vigilante', 'medium', 'witness', 'bodyguard', 'doctor'];
+    for (let i = 0; i < roles.length; i++) {
+      const open = specials.filter((r) => !roles.includes(r));
+      if (roles[i] === 'guest' && open.length && Math.random() < 0.5) roles[i] = pick(open);
+    }
+  }
   return roles;
 }
 
 function assignRoles(g) {
-  const shuffledRoles = shuffle(roleList(g.players.length));
+  const shuffledRoles = g.forceRoles ?? shuffle(roleList(g.players.length, g.mode));
   const chars = shuffle([...CHARACTERS]);
   const traitPools = Object.fromEntries(Object.entries(TRAITS).map(([k, v]) => [k, shuffle([...v])]));
   g.players.forEach((p, i) => {
@@ -357,7 +454,24 @@ function assignRoles(g) {
     p.startRole = p.role;
     p.char = { name: chars[i][0], title: chars[i][1] };
     p.traits = { garment: traitPools.garment[i], scent: traitPools.scent[i], mark: traitPools.mark[i] };
+    if (p.role === 'survivor') p.vests = 2;
   });
+  // Executioners get a guest-side target; with nobody suitable they're just a Jester.
+  for (const exe of g.players.filter((p) => p.role === 'executioner')) {
+    const options = g.players.filter((p) => team(p) === 'town');
+    const target = (g.forceExeTarget && byId(g, g.forceExeTarget)) ?? pick(options);
+    if (target) exe.exeTarget = target.id; else { exe.role = 'jester'; exe.startRole = 'jester'; }
+  }
+  // Lovers: always in chaos mode, sometimes in big games. Never two of the murder team (they already know each other).
+  const n = g.players.length;
+  let pair = g.forceLovers?.map((id) => byId(g, id));
+  if (!pair && ((g.mode === 'chaos' && n >= 5) || (n >= 9 && Math.random() < 0.4))) {
+    for (let tries = 0; tries < 20 && !pair; tries++) {
+      const [a, b] = shuffle([...g.players]);
+      if (!(isMurderTeam(a) && isMurderTeam(b))) pair = [a, b];
+    }
+  }
+  if (pair) { pair[0].lover = pair[1].id; pair[1].lover = pair[0].id; }
 }
 
 async function prologue(g) {
@@ -383,15 +497,21 @@ async function prologue(g) {
 async function nightPhase(g) {
   g.day++;
   g.phase = 'night';
-  g.night = { kill: null, killer: null, weapon: null, protects: new Set(), guards: new Map(), frames: new Set(), frameClue: null, clean: false, inspects: new Map(), watches: new Map(), visits: new Map(), acted: new Set() };
+  g.night = { kill: null, killer: null, weapon: null, protects: new Set(), guards: new Map(), frames: new Set(), frameClue: null, clean: false, inspects: new Map(), watches: new Map(), visits: new Map(), shots: new Map(), vests: new Set(), acted: new Set() };
   const s = g.setting;
-  await say(g, `### 🌙 Night ${g.day}\n> *${pick(s.night)}*\n> Everyone returns to their rooms. Those with a night role: check your DMs.\n-# night ends in ${secs(T.night())} or when everyone has acted`);
+  const nightMs = pace(g, T.night());
+  await say(g, `### 🌙 Night ${g.day}\n> *${pick(s.night)}*\n> Everyone returns to their rooms. Those with a night role: check your DMs.\n-# night ends in ${secs(nightMs)} or when everyone has acted`);
 
-  const actors = () => alive(g).filter((p) => ROLES[p.role].night);
+  const actors = () => alive(g).filter((p) => nightAction(p));
   for (const p of actors()) p.dmChannel?.send(nightPrompt(g, p)).catch(() => {});
+  for (const p of alive(g).filter((x) => x.role === 'survivor' && x.vests)) p.dmChannel?.send(`### 🏕️ Night ${g.day}\n> DM me \`vest\` to wear a bulletproof vest tonight (${p.vests} left).`).catch(() => {});
+  if (alive(g).some((x) => x.role === 'medium') && g.players.some((x) => !x.alive)) {
+    for (const p of alive(g).filter((x) => x.role === 'medium')) p.dmChannel?.send(`### 🔮 Night ${g.day}\n> The veil is thin. DM me anything and the dead will hear it.`).catch(() => {});
+    for (const p of g.players.filter((x) => !x.alive)) p.dmChannel?.send('### 🔮 A medium is listening tonight\n> Anything you DM me now reaches them.').catch(() => {});
+  }
 
   const done = () => actors().every((p) => (p.role === 'murderer' ? g.night.kill : g.night.acted.has(p.id)));
-  await waitFor(g, done, T.night());
+  await waitFor(g, done, nightMs);
   g.phase = 'resolving';
   const n = g.night;
 
@@ -401,7 +521,7 @@ async function nightPhase(g) {
   for (const [detId, targetId] of n.inspects) {
     const det = byId(g, detId), target = byId(g, targetId);
     const suspicious = target.role === 'murderer' || n.frames.has(target.id);
-    if (target.role === 'murderer') award(det, 2);
+    if (target.role === 'murderer') { award(det, 2); det.foundMurderer = true; }
     det.dmChannel?.send(`### 🔍 Dawn report: ${label(target)} looks ${suspicious ? '**SUSPICIOUS** 🔪' : '**innocent** 😇'}\n-# framed people look suspicious, and the accomplice looks innocent`).catch(() => {});
   }
 
@@ -426,7 +546,7 @@ async function nightPhase(g) {
   }
 
   const events = EVENTS.filter((e) => alive(g).length >= (e.min ?? 0));
-  const event = process.env.MM_EVENTS === 'off' ? null : events.find((e) => Math.random() < e.chance);
+  const event = process.env.MM_EVENTS === 'off' ? null : events.find((e) => Math.random() < e.chance * (g.mode === 'chaos' ? 2.5 : 1));
   const noClues = n.clean || event?.id === 'outage';
   const bodyguard = [...n.guards].find(([, t]) => t === victim.id)?.[0];
 
@@ -440,14 +560,17 @@ async function nightPhase(g) {
     killer.kills = (killer.kills ?? 0) + 1;
     award(killer, 3);
     award(dead, 3);
+    dead.hero = true;
     lines.push(`### 🛡️ ${dead.char.name} died a hero`, `> ${label(dead)} threw themselves in front of ${label(victim)} in the **${room}** and was ${weapon[1]}.`,
       `> They were the **Bodyguard** 🛡️. With their last breath they saw something…`, ...willLines(dead));
     const c = makeClue(g, { culprit: killer, anchor: killer, options: 2 });
     lines.push('', clueText(c));
     g.events.push(`Night ${g.day}: ${plain(dead)} (Bodyguard) died protecting ${plain(victim)} from ${plain(killer)}.`);
-  } else if (n.protects.has(victim.id)) {
-    for (const doc of alive(g).filter((x) => x.role === 'doctor' && n.visits.get(x.id) === victim.id)) award(doc, 3);
-    lines.push('### 💉 A close call', `> ${label(victim)} was attacked in the **${room}**, but someone got there just in time. They’re shaken, but alive.`);
+  } else if (n.protects.has(victim.id) || n.vests.has(victim.id)) {
+    for (const doc of alive(g).filter((x) => x.role === 'doctor' && n.visits.get(x.id) === victim.id)) { award(doc, 3); doc.saves = (doc.saves ?? 0) + 1; }
+    lines.push('### 💉 A close call', n.protects.has(victim.id)
+      ? `> ${label(victim)} was attacked in the **${room}**, but someone got there just in time. They’re shaken, but alive.`
+      : `> ${label(victim)} was attacked in the **${room}**, but the blow hit a bulletproof vest. They’re bruised, but alive.`);
     if (!noClues) lines.push('', clueText(makeClue(g, { culprit: killer, anchor: n.frameClue ? byId(g, n.frameClue) : null })));
     g.events.push(`Night ${g.day}: ${plain(victim)} was attacked by ${plain(killer)}, but the Doctor saved them.`);
   } else {
@@ -479,6 +602,28 @@ async function nightPhase(g) {
     }
   }
 
+  // The Vigilante fires after the killer has struck.
+  for (const [vigId, targetId] of n.shots) {
+    const vig = byId(g, vigId), target = byId(g, targetId);
+    vig.usedShot = true;
+    if (!target.alive) { lines.push('', `> 🔫 A gunshot echoes through the halls… but ${target.char.name} was already dead.`); continue; }
+    if (n.protects.has(target.id) || n.vests.has(target.id)) {
+      lines.push('', '### 🔫 A gunshot at dawn', `> Someone fired at ${label(target)}, but they survived.`);
+      g.events.push(`Night ${g.day}: ${plain(vig)} (Vigilante) shot at ${plain(target)}, who survived.`);
+      continue;
+    }
+    target.alive = false;
+    lines.push('', '### 🔫 A gunshot at dawn', `> ${label(target)} was shot dead. They were the **${ROLES[target.role].name}** ${ROLES[target.role].emoji}.`, ...willLines(target));
+    g.events.push(`Night ${g.day}: ${plain(vig)} (Vigilante) shot ${plain(target)} (${ROLES[target.role].name}).`);
+    if (isMurderTeam(target)) { award(vig, 4); vig.vigKill = true; }
+    else if (team(target) === 'town' && vig.alive) {
+      vig.alive = false;
+      lines.push(`> 😔 **${vig.char.name}**, the Vigilante, couldn’t live with what they’d done.`, ...willLines(vig));
+      g.events.push(`Night ${g.day}: ${plain(vig)} (Vigilante) died of guilt.`);
+    }
+  }
+  aftermath(g, lines);
+
   const shown = dead ?? victim;
   const kind = !dead ? 'saved' : dead.role === 'bodyguard' && dead !== victim ? 'hero' : 'dead';
   await sayWithArt(g, lines.join('\n'), () => art.sceneCard({
@@ -501,14 +646,15 @@ async function dayPhase(g) {
   g.phase = 'day';
   g.skip = false;
   g.searched = new Map(); // room -> player who searched it today
-  const ms = T.day(alive(g).length);
+  const ms = pace(g, T.day(alive(g).length));
   await say(g, card({
     title: `Day ${g.day} · Investigation`, emoji: '☀️',
     body: [
       'Cross-check the clues against the guests’ traits. Accuse, defend, lie.',
       `🔍 Everyone alive can **\`mm search <room>\`** once today, and each room can only be searched once. Rooms: ${g.setting.rooms.join(', ')}.`,
       g.lastRoom ? `-# last night’s scene: the ${g.lastRoom} (best odds of evidence)` : null,
-      '-# 🎩 a Mayor can `mm reveal` · 👻 the dead can DM me `haunt <#>` once',
+      '🔦 Once a day, someone can `mm question <guest>` to put them on the spot.',
+      '-# 🎩 a Mayor can `mm reveal` · 👻 the dead can DM me `haunt <#>` once · 🎰 the dead and spectators can `mm bet <guest> <coins>` · `mm board`',
     ],
     footer: `accusations open in ${secs(ms)} · host can \`mm skip\` · ${alive(g).length} alive · \`mm clues\``,
   }));
@@ -534,7 +680,7 @@ function voteBoard(g, closed = false) {
     `### 🗳️ Day ${g.day} · ${closed ? 'Accusations are in' : 'Who should stand trial?'}`,
     closed ? null : `> \`vote <number or name>\` or \`vote skip\` · needs **${accusationsNeeded(g)}** votes to go to trial\n${numbered(g).split('\n').map((l) => `> ${l}`).join('\n')}`,
     ansiBlock(rows),
-    `-# ${g.votes.size}/${alive(g).length} voted${closed ? '' : ` · ${secs(T.vote())} · you can change your vote`}`,
+    `-# ${g.votes.size}/${alive(g).length} voted${closed ? '' : ` · ${secs(pace(g, T.vote()))} · you can change your vote`}`,
   ].filter(Boolean).join('\n');
 }
 
@@ -551,7 +697,7 @@ function trialBoard(g, closed = false) {
       `### ⚖️ Trial of ${accused.char.name}${closed ? ' · verdict' : ''}`,
       closed ? null : '> Type **`guilty`** or **`innocent`** (the accused can’t vote)',
       ansiBlock([`${color('GUILTY  ', 'red', true)} ${color('█'.repeat(guilty) || '·', 'red', true)} ${guilty}`, `${color('INNOCENT', 'green', true)} ${color('█'.repeat(innocent) || '·', 'green', true)} ${innocent}`]),
-      `-# ${votes.size}/${alive(g).length - 1} voted · a tie means innocent${closed ? '' : ` · ${secs(T.trial())}`}`,
+      `-# ${votes.size}/${alive(g).length - 1} voted · a tie means innocent${closed ? '' : ` · ${secs(pace(g, T.trial()))}`}`,
     ].filter(Boolean).join('\n'),
   };
 }
@@ -560,7 +706,7 @@ async function votePhase(g) {
   g.phase = 'vote';
   g.votes = new Map();
   g.voteMsg = await g.channel.send(voteBoard(g));
-  await waitFor(g, () => g.votes.size >= alive(g).length, T.vote());
+  await waitFor(g, () => g.votes.size >= alive(g).length, pace(g, T.vote()));
   g.phase = 'resolving';
   await g.voteMsg.edit(voteBoard(g, true)).catch(() => {});
 
@@ -577,8 +723,9 @@ async function votePhase(g) {
 async function trialPhase(g, accused) {
   g.trial = { accused, votes: new Map() };
   g.phase = 'defense';
-  await say(g, `### ⚖️ ${accused.char.name} is on trial!\n> <@${accused.id}>, you have **${secs(T.defense())}** to defend yourself. Everyone else: listen.`);
-  await waitFor(g, () => false, T.defense());
+  accused.trials = (accused.trials ?? 0) + 1;
+  await say(g, `### ⚖️ ${accused.char.name} is on trial!\n> <@${accused.id}>, you have **${secs(pace(g, T.defense()))}** to defend yourself. Everyone else: listen.`);
+  await waitFor(g, () => false, pace(g, T.defense()));
   g.phase = 'trial';
   g.trialMsg = await g.channel.send(trialBoard(g).text);
   // Plain "guilty" / "innocent" messages count too (no prefix needed during a trial).
@@ -589,13 +736,14 @@ async function trialPhase(g, accused) {
       if (m && open) castVerdict(g, m, m.content.trim().toLowerCase());
     }
   })().catch(() => {});
-  await waitFor(g, () => g.trial.votes.size >= alive(g).length - 1, T.trial());
+  await waitFor(g, () => g.trial.votes.size >= alive(g).length - 1, pace(g, T.trial()));
   open = false;
   g.phase = 'resolving';
   const { guilty, innocent, text } = trialBoard(g, true);
   await g.trialMsg.edit(text).catch(() => {});
 
   if (guilty <= innocent) {
+    if (isMurderTeam(accused)) accused.acquitted = true;
     g.events.push(`Day ${g.day}: ${plain(accused)} was tried and found innocent (${guilty}–${innocent}).`);
     return sayWithArt(g, `### 🕊️ ${accused.char.name} is acquitted\n> The vote was ${guilty}–${innocent}. They walk free, for now.`, () => art.sceneCard({
       kind: 'acquitted', headline: `Day ${g.day} · The trial`, name: accused.char.name, subtitle: `@${accused.user.username} · ${accused.char.title}`,
@@ -623,8 +771,13 @@ async function trialPhase(g, accused) {
     award(accused, 5);
     lines.push('', '> 🃏 **…and they’re laughing.** The Jester wanted this. **The Jester wins!**');
   }
-  const heir = promoteAccomplice(g);
-  if (heir) lines.push('', '> 🔪 *Somewhere in the house, someone picks up the knife…* (the killing isn’t over)');
+  for (const exe of g.players.filter((x) => x.role === 'executioner' && x.exeTarget === accused.id && x.alive && !x.exeWon)) {
+    exe.exeWon = true;
+    award(exe, 5);
+    lines.push('', `> ⚖️ Somewhere in the crowd, someone smiles. ${accused.char.name} was the Executioner’s target. **The Executioner wins!** (they stay in the game)`);
+    g.events.push(`Day ${g.day}: ${plain(exe)} (Executioner) got their target convicted.`);
+  }
+  aftermath(g, lines);
   return sayWithArt(g, lines.join('\n'), () => art.sceneCard({
     kind: 'guilty', headline: `Day ${g.day} · The trial`, name: accused.char.name, subtitle: `@${accused.user.username} · ${accused.char.title}`,
     role: accused.role === 'jester' ? 'Jester · wins!' : r.name, roleColor: ROLE_COLORS[accused.role],
@@ -632,32 +785,89 @@ async function trialPhase(g, accused) {
   }), `trial-${g.day}.png`);
 }
 
+const ACHIEVEMENTS = {
+  first_win: ['🥇', 'Case Closed', 'Win your first mystery'],
+  perfect_murder: ['🔪', 'Perfect Murder', 'Win as a murderer without ever standing trial'],
+  sharp_eye: ['🔍', 'Sharp Eye', 'Catch a murderer as the Detective'],
+  guardian: ['💉', 'Guardian Angel', 'Save someone as the Doctor'],
+  martyr: ['🛡️', 'Martyr', 'Die protecting someone as the Bodyguard'],
+  fool: ['🃏', 'Fool’s Gold', 'Get convicted as the Jester'],
+  hanging_judge: ['⚖️', 'Hanging Judge', 'Get your target convicted as the Executioner'],
+  still_standing: ['🏕️', 'Still Standing', 'Survive to the end as the Survivor'],
+  lovebirds: ['💘', 'Lovebirds', 'Make it to the end with your lover alive'],
+  sharpshooter: ['🔫', 'Sharpshooter', 'Shoot a killer as the Vigilante'],
+  silver_tongue: ['🗣️', 'Silver Tongue', 'Get acquitted while on the murder team'],
+  veteran: ['🎖️', 'Veteran', 'Play 25 mysteries'],
+};
+
+function earnedAchievements(g, p, side, winners) {
+  const lover = p.lover ? byId(g, p.lover) : null;
+  return Object.entries({
+    first_win: winners.includes(p),
+    perfect_murder: p.startRole === 'murderer' && side === 'murderers' && !p.trials,
+    sharp_eye: p.foundMurderer,
+    guardian: p.saves > 0,
+    martyr: p.hero,
+    fool: g.jesterWinner === p,
+    hanging_judge: p.exeWon,
+    still_standing: p.role === 'survivor' && p.alive,
+    lovebirds: !!lover && p.alive && lover.alive,
+    sharpshooter: p.vigKill,
+    silver_tongue: p.acquitted,
+    veteran: stats(p.id).games >= 25,
+  }).filter(([, ok]) => ok).map(([id]) => id);
+}
+
 async function finale(g, side) {
   g.phase = 'over';
   const winners = g.players.filter((p) => (side === 'town' ? team(p) === 'town' : team(p) === 'murderers'));
   if (g.jesterWinner) winners.push(g.jesterWinner);
+  const exes = g.players.filter((p) => p.exeWon);
+  const survivors = g.players.filter((p) => p.role === 'survivor' && p.alive);
+  winners.push(...exes, ...survivors);
   const score = (p) => (p.points ?? 0) + (p.alive ? 1 : 0);
   const mvp = [...winners].sort((a, b) => score(b) - score(a))[0];
+  const unlocked = [];
   for (const p of g.players) {
     const s = stats(p.id);
+    s.name = p.user.username;
     s.games++;
     if (p.startRole === 'murderer' || p.role === 'murderer') s.murderer++;
     if (winners.includes(p)) s.wins++;
     eco.add(p.id, winners.includes(p) ? WIN_REWARD + (p === mvp ? MVP_BONUS : 0) : PLAY_REWARD);
+    for (const id of earnedAchievements(g, p, side, winners)) {
+      if (s.achievements.includes(id)) continue;
+      s.achievements.push(id);
+      unlocked.push(`> ${ACHIEVEMENTS[id][0]} **${p.user.username}** unlocked **${ACHIEVEMENTS[id][1]}**: ${ACHIEVEMENTS[id][2].toLowerCase()}`);
+    }
+  }
+  // Spectator / ghost bets on who the killer was.
+  const betLines = [];
+  for (const [id, b] of g.bets ?? []) {
+    const target = byId(g, b.target);
+    const won = startedOnMurderTeam(target);
+    const back = won ? Math.floor(b.amount * b.mult) : 0;
+    eco.settle(id, b.amount, back);
+    b.settled = true;
+    betLines.push(`> ${won ? '💰' : '💸'} **${b.user.username}** bet ${eco.fmt(b.amount)} on ${target.char.name}: ${won ? `won ${eco.fmt(back)}` : 'lost'}`);
   }
   save();
-  const roleLines = g.players.map((p) => `> ${ROLES[p.startRole].emoji} ${label(p)}: **${ROLES[p.startRole].name}**${p.startRole !== p.role ? ` → ${ROLES[p.role].name}` : ''}${p.alive ? '' : ' ☠️'}${p === mvp ? ' 🏅 MVP' : ''}`);
+  const roleLines = g.players.map((p) => `> ${ROLES[p.startRole].emoji} ${label(p)}: **${ROLES[p.startRole].name}**${p.startRole !== p.role ? ` → ${ROLES[p.role].name}` : ''}${p.lover ? ' 💘' : ''}${p.alive ? '' : ' ☠️'}${p === mvp ? ' 🏅 MVP' : ''}`);
   await sayWithArt(g, [
     side === 'town'
       ? `# 🎉 The guests win!\n> Every murderer has been caught. ${g.setting.name} is safe… for now.`
       : `# 🔪 The murderers win!\n> By dawn, there's nobody left to stop them.`,
     g.jesterWinner ? `> 🃏 ${label(g.jesterWinner)} the Jester also wins.` : null,
+    ...exes.map((p) => `> ⚖️ ${label(p)} the Executioner also wins.`),
+    ...survivors.map((p) => `> 🏕️ ${label(p)} survived, and wins too.`),
     '',
     '### 🎭 The truth',
     ...roleLines,
     '',
     '### 📜 What happened',
     ...g.events.map((e) => `> ${e}`),
+    ...(betLines.length ? ['', '### 🎰 Bets', ...betLines] : []),
+    ...(unlocked.length ? ['', '### 🏆 Achievements', ...unlocked] : []),
     `-# winners +🪙 ${WIN_REWARD} · MVP +🪙 ${MVP_BONUS} · everyone else +🪙 ${PLAY_REWARD} · \`mm stats\``,
   ].filter((l) => l !== null).join('\n'), () => art.gameOverCard({
     side,
@@ -748,8 +958,9 @@ function lobbyText(g, p) {
       '',
       'Secret roles by DM · clues point at traits (some lie) · searches · trials · night events',
       `Roles at this size: ${[...new Set(roleList(Math.max(g.players.length, T.min())))].map((r) => ROLES[r].emoji).join(' ')}`,
+      `Mode: ${MODES[g.mode].emoji} **${g.mode}** (${MODES[g.mode].blurb})`,
     ],
-    footer: `${p}mm join · ${p}mm leave · host: ${p}mm start`,
+    footer: `${p}mm join · ${p}mm leave · host: ${p}mm start [classic | quick | chaos]`,
   });
 }
 
@@ -759,8 +970,8 @@ module.exports = [
   {
     name: 'mystery',
     aliases: ['mm', 'murder', 'murdermystery'],
-    usage: 'mm [join | leave | start | stop | skip | search <room> | reveal | clues | guests | roles | stats]',
-    description: 'Murder mystery: secret roles by DM, murders, clues, searches, trials (4–25 players).',
+    usage: 'mm [join | leave | start [quick|chaos] | stop | skip | search <room> | question <guest> | reveal | board | bet <guest> <coins> | clues | guests | roles | stats | top]',
+    description: 'Murder mystery: secret roles by DM, murders, clues, searches, trials (4–25 players). Modes: classic, quick, chaos.',
     async run({ client, message, args, config }) {
       const p = config.prefix;
       const sub = (args[0] ?? '').toLowerCase();
@@ -774,19 +985,37 @@ module.exports = [
         const s = stats(user.id);
         return ch.send(card({
           title: `${user.username}'s mystery record`, emoji: '🔪',
-          body: [`🎮 **${s.games}** games · 🏆 **${s.wins}** wins (${s.games ? Math.round((s.wins / s.games) * 100) : 0}%)`, `🔪 **${s.kills}** kills · played murderer **${s.murderer}**×`, `⚖️ **${s.convictions}** murderers convicted`],
+          body: [
+            `🎮 **${s.games}** games · 🏆 **${s.wins}** wins (${s.games ? Math.round((s.wins / s.games) * 100) : 0}%)`,
+            `🔪 **${s.kills}** kills · played murderer **${s.murderer}**×`,
+            `⚖️ **${s.convictions}** murderers convicted`,
+            `🏆 Achievements (${s.achievements.length}/${Object.keys(ACHIEVEMENTS).length}): ${s.achievements.length ? s.achievements.map((id) => `${ACHIEVEMENTS[id][0]} ${ACHIEVEMENTS[id][1]}`).join(' · ') : 'none yet'}`,
+          ],
+        }));
+      }
+      if (sub === 'top' || sub === 'leaderboard' || sub === 'lb') {
+        const by = ['wins', 'kills', 'convictions', 'games'].includes(args[1]) ? args[1] : 'wins';
+        const rows = Object.entries(data.mmStats ?? {}).filter(([, s]) => s.games > 0).sort((a, b) => b[1][by] - a[1][by] || b[1].wins - a[1].wins).slice(0, 10);
+        if (!rows.length) return ch.send('### 🔪 Mystery leaderboard\n> Nobody has finished a game yet.');
+        return ch.send(card({
+          title: `Mystery leaderboard · ${by}`, emoji: '🏆',
+          body: rows.map(([id, s], i) => `${['🥇', '🥈', '🥉'][i] ?? `\`${i + 1}\``} **${s.name ?? `<@${id}>`}** · ${s[by]} ${by} · ${s.games ? Math.round((s.wins / s.games) * 100) : 0}% wins · ${s.achievements?.length ?? 0} 🏆`),
+          footer: `${p}mm top [wins | kills | convictions | games]`,
         }));
       }
       if (sub === 'roles') {
-        return ch.send(`### 🎭 Roles\n${Object.values(ROLES).map((r) => `> ${r.emoji} **${r.name}**: ${r.goal}`).join('\n')}\n-# 4: 🔪🔍 · 5: +💉 · 6: +🃏 · 7: +🤝 · 8: +🎩 · 9: +👁️ · 10: +🛡️ · 11: 2nd 🔪 · 15: 2nd 🔍 · 17: 3rd 🔪\n-# everyone: DM me \`will <text>\` for a last will · the dead can \`haunt <#>\` once`);
+        return ch.send(`### 🎭 Roles\n${Object.values(ROLES).map((r) => `> ${r.emoji} **${r.name}**: ${r.goal}`).join('\n')}\n> 💘 **Lovers** (chaos mode, sometimes 9+): two players linked. If one dies, so does the other.\n-# 4: 🔪🔍 · 5: +💉 · 6: +🃏 · 7: +🤝 · 8: +🎩 · 9: +👁️ · 10: +🛡️ · 11: 2nd 🔪 +🏕️ · 12: +⚖️ · 13: +🔫 · 14: +🔮 · 15: 2nd 🔍 · 17: 3rd 🔪 · chaos: more specials\n-# everyone: DM me \`will <text>\` for a last will · the dead can \`haunt <#>\` once`);
       }
 
       if (!g) {
         if (sub && !['start', 'join', 'new', 'host'].includes(sub)) return message.reply(`No game running. Start one with \`${p}mm\`.`);
         if (playerGame.has(me.id)) return message.reply("You're already in a murder mystery somewhere else.");
-        g = { channel: ch, host: me, phase: 'lobby', players: [newPlayer(me)], setting: pick(SETTINGS), clues: [], events: [], day: 0, votes: new Map() };
+        if (party.playingIn(me.id)) return message.reply(`You're already in a game of **${party.playingIn(me.id)}**.`);
+        if (!party.claimChannel(message, NAME)) return;
+        g = { channel: ch, host: me, phase: 'lobby', mode: 'classic', players: [newPlayer(me)], setting: pick(SETTINGS), clues: [], events: [], day: 0, votes: new Map(), bets: new Map() };
         games.set(ch.id, g);
         playerGame.set(me.id, g);
+        party.lockPlayer(me.id, NAME);
         g.lobbyMsg = await ch.send(lobbyText(g, p));
         return;
       }
@@ -795,10 +1024,11 @@ module.exports = [
         if (g.phase !== 'lobby') return message.reply('The game already started. Catch the next one!');
         if (me.id === client.user.id) return message.reply("I'm the narrator, I can't play. 🎭");
         if (byId(g, me.id)) return message.reply("You're already in.");
-        if (playerGame.has(me.id)) return message.reply("You're in another game.");
+        if (playerGame.has(me.id) || party.playingIn(me.id)) return message.reply("You're in another game.");
         if (g.players.length >= MAX_PLAYERS) return message.reply('The lobby is full.');
         g.players.push(newPlayer(me));
         playerGame.set(me.id, g);
+        party.lockPlayer(me.id, NAME);
         await g.lobbyMsg.edit(lobbyText(g, p)).catch(() => {});
         return message.reply(`🎭 You're in! (${g.players.length} players)`);
       }
@@ -807,15 +1037,27 @@ module.exports = [
         if (!byId(g, me.id)) return message.reply("You're not in this game.");
         g.players = g.players.filter((x) => x.id !== me.id);
         playerGame.delete(me.id);
+        party.unlockPlayer(me.id, NAME);
         if (!g.players.length) { cleanup(g); return ch.send('🎭 Lobby closed (everyone left).'); }
         if (g.host.id === me.id) g.host = g.players[0].user;
         await g.lobbyMsg.edit(lobbyText(g, p)).catch(() => {});
         return message.reply('👋 You left the lobby.');
       }
+      if (sub === 'mode') {
+        if (g.phase !== 'lobby') return message.reply('The mode is set before the game starts.');
+        if (!isHost) return message.reply(`Only the host (${g.host.username}) can change the mode.`);
+        const mode = (args[1] ?? '').toLowerCase();
+        if (!MODES[mode]) return message.reply(`Modes: ${Object.entries(MODES).map(([k, v]) => `${v.emoji} \`${k}\` (${v.blurb})`).join(' · ')}`);
+        g.mode = mode;
+        await g.lobbyMsg.edit(lobbyText(g, p)).catch(() => {});
+        return message.reply(`${MODES[mode].emoji} Mode set to **${mode}**.`);
+      }
       if (sub === 'start') {
         if (g.phase !== 'lobby') return message.reply('Already running!');
         if (!isHost) return message.reply(`Only the host (${g.host.username}) can start.`);
         if (g.players.length < T.min()) return message.reply(`Need at least ${T.min()} players (have ${g.players.length}). \`${p}mm join\``);
+        if (args[1] && MODES[args[1].toLowerCase()]) g.mode = args[1].toLowerCase();
+        if (g.mode !== 'classic') await ch.send(`### ${MODES[g.mode].emoji} ${g.mode[0].toUpperCase()}${g.mode.slice(1)} mode\n> ${MODES[g.mode].blurb}`);
         runGame(g);
         return;
       }
@@ -850,6 +1092,55 @@ module.exports = [
         g.events.push(`Day ${g.day}: ${plain(player)} revealed themselves as the Mayor.`);
         if (g.phase === 'trial') g.trialMsg?.edit(trialBoard(g).text).catch(() => {});
         return ch.send(`### 🎩 ${player.char.name} is the Mayor!\n> ${label(player)} stands on a chair and produces the deed to the house. Their verdict at trials now counts **triple**.\n-# …and the killer knows exactly who they are now`);
+      }
+      if (sub === 'board') {
+        if (!g.players[0].char) return message.reply('The board goes up once the game starts.');
+        const traitOf = (x) => [x.traits.garment[0], x.traits.scent[0], x.traits.mark[0]];
+        const guests = g.players.map((x) => ({
+          name: x.char.name, user: x.user.username, traits: traitOf(x), alive: x.alive,
+          role: x.alive ? null : ROLES[x.role].name, roleColor: ROLE_COLORS[x.role], mayor: x.alive && x.revealed,
+          pins: g.clues.filter((c) => c.options.some((o) => traitOf(x).includes(o))).map((c) => c.n),
+        }));
+        return sayWithArt(g, `### 📌 Evidence board\n-# red tags show which clues mention each guest. remember: some clues are lies`, () => art.evidenceBoard({
+          setting: g.setting.name, day: g.day, guests, clues: g.clues,
+        }), 'evidence-board.png');
+      }
+      if (sub === 'bet') {
+        if (['lobby', 'ready', 'over'].includes(g.phase)) return message.reply('Bets open once the game is underway.');
+        if (me.id === client.user.id) return;
+        const player = byId(g, me.id);
+        if (player?.alive) return message.reply('Only the dead and spectators can bet. 👻');
+        if (player && startedOnMurderTeam(player)) return message.reply('Ghosts of the murder team know too much to bet. 🔪');
+        if (g.bets.has(me.id)) return message.reply('You already placed a bet this game.');
+        const target = findTarget(g, args.slice(1, -1).join(' '));
+        const raw = eco.parseBet(me.id, args.at(-1));
+        if (!target || !raw || args.length < 3) return message.reply(`Usage: \`${p}mm bet <guest> <coins>\` (an alive guest you think is on the murder team, up to ${eco.fmt(BET_MAX)})`);
+        const amount = Math.min(raw, BET_MAX);
+        const murderTeam = Math.max(1, alive(g).filter(isMurderTeam).length);
+        const mult = Math.min(6, Math.max(1.5, Math.round((alive(g).length / murderTeam) * 0.8 * 10) / 10));
+        eco.take(me.id, amount);
+        g.bets.set(me.id, { target: target.id, amount, mult, user: me, settled: false });
+        return ch.send(`### 🎰 ${me.username} bets ${eco.fmt(amount)} on ${label(target)}\n> Pays **${mult}×** if they turn out to be on the murder team.\n-# settled when the game ends`);
+      }
+      if (sub === 'question' || sub === 'interrogate') {
+        const player = byId(g, me.id);
+        if (!player?.alive) return message.reply('Only living players can interrogate.');
+        if (g.phase !== 'day') return message.reply('Interrogations happen during the investigation.');
+        if (g.questionDay === g.day) return message.reply('Someone has already been interrogated today.');
+        if (player.usedQuestion) return message.reply('You already used your interrogation this game.');
+        const target = findTarget(g, args.slice(1).join(' '), (x) => x !== player);
+        if (!target) return message.reply(`Question who?\n${numbered(g, (x) => x !== player)}`);
+        g.questionDay = g.day;
+        player.usedQuestion = true;
+        const q = pick(QUESTIONS).replace('{room}', g.lastRoom ?? pick(g.setting.rooms)).replace('{host}', g.setting.host);
+        await ch.send(`### 🔦 Interrogation\n> **${player.char.name}** turns the lamp on ${label(target)}:\n> *“${q}”*\n-# <@${target.id}>, answer in the chat within ${secs(T.question())}`);
+        const ans = await awaitReply(ch, (x) => x.author.id === target.id && !x.content.startsWith(p), T.question());
+        if (ans) {
+          g.events.push(`Day ${g.day}: ${plain(target)} was interrogated by ${plain(player)}.`);
+          return ch.send(`> 🗣️ **${target.char.name}:** “${sanitize(ans.content).slice(0, 300)}”`);
+        }
+        g.events.push(`Day ${g.day}: ${plain(target)} refused to answer ${plain(player)}’s interrogation.`);
+        return ch.send(`### 🤐 ${target.char.name} says nothing\n> The silence is deafening. Suspicious…`);
       }
       if (sub === 'clues') {
         if (!g.clues.length) return message.reply('No clues yet.');
@@ -899,4 +1190,4 @@ module.exports = [
   })),
 ];
 
-module.exports.internals = { games, playerGame, assignRoles, roleList, makeClue, winner, stats, runGame, willExcerpt };
+module.exports.internals = { games, playerGame, assignRoles, roleList, makeClue, winner, stats, runGame, willExcerpt, ACHIEVEMENTS };

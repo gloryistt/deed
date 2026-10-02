@@ -311,7 +311,10 @@ module.exports = async function partyTests(h) {
     check('connect4: board image', /\[file connect4\.png \d{4,}B\]/.test(gcFind(/'s turn/)), gcFind(/'s turn/).slice(0, 50));
     let r = await say(second, '1');
     check('connect4: only the current player moves', !/'s turn/.test(r), r);
-    for (let k = 0; k < 3; k++) { await say(first, '1'); await say(second, '2'); }
+    // Wait for each turn prompt (the board image renders first) before moving.
+    const turns = () => h.log.filter((m) => /'s turn/.test(m.content) && /connect4/.test(m.content)).length;
+    const move = async (u, col) => { const n = turns(); await say(u, col); await until(() => turns() > n || /connects four/.test(gcFind(/connects four/)), 4000); };
+    for (let k = 0; k < 3; k++) { await move(first, '1'); await move(second, '2'); }
     await say(first, '1');
     await until(() => /connects four/.test(gcFind(/connects four/)), 3000);
     check('connect4: four in a column wins + pays', new RegExp(`${first.username} connects four`).test(gcFind(/connects four/)) && eco.balance(first.id) === (first === alice ? a0 : b0) + 50, gcFind(/connects four/).slice(0, 80));
@@ -361,6 +364,7 @@ module.exports = async function partyTests(h) {
     // Game A: executioner, vigilante vs vest, lovers, bets, interrogation, board, achievements.
     const six = [alice, bob, carol, dave, frank, gina];
     for (const u of six) eco.add(u.id, 1000);
+    await until(() => !party.channelGame(h.channel) && !party.playingIn(alice.id), 20000); // the previous game may still be posting its last image
     await say(alice, '!mm');
     for (const u of six.slice(1)) await say(u, '!mm join');
     const g = mm.games.get(h.channel.id);
@@ -379,6 +383,8 @@ module.exports = async function partyTests(h) {
     check('mm: executioner told their target', /Your target: \*\*.+\*\* \(carol\)/.test(roleDM(bob)), roleDM(bob));
     check('mm: lovers told about each other', /in love with .+\(gina\)/.test(roleDM(dave)) && /in love with .+\(dave\)/.test(roleDM(gina)));
     check('mm: survivor starts with 2 vests', /2 left/.test(roleDM(frank)), roleDM(frank));
+    check('mm: role card comes with a dossier image', /\[file dossier\.png \d{4,}B\]/.test(roleDM(bob)), roleDM(bob).slice(0, 60));
+    await dmTo(gina, 'will it was the colonel, I saw him');
     await dmTo(frank, 'vest');
     check('mm: survivor vest', /Vest on/.test(lastDM(frank)), lastDM(frank));
     await dmTo(carol, `shoot ${frank.username}`);
@@ -388,6 +394,9 @@ module.exports = async function partyTests(h) {
     const morning = gcFind(/is dead/);
     check('mm: lover dies of a broken heart', !g.players.find((p) => p.id === dave.id).alive && /broken heart/.test(morning), morning.slice(0, 300));
     check('mm: vest stops the vigilante', g.players.find((p) => p.id === frank.id).alive && /but they survived/.test(morning));
+    check('mm: morning newspaper', /\[file night-1\.png \d{4,}B\]/.test(morning), morning.slice(0, 60));
+    await until(() => /last will of/.test(gcFind(/last will of/)), 8000);
+    check('mm: will posted on parchment', /\[file will-\d+\.png \d{4,}B\] -# 📜 the last will of/.test(gcFind(/the last will of/)), gcFind(/last will of/).slice(0, 80));
 
     r = await say(bob, '!mm bet alice 100');
     check('mm: living players cannot bet', /Only the dead and spectators/.test(r), r);
@@ -411,39 +420,71 @@ module.exports = async function partyTests(h) {
     for (const u of [alice, bob, frank]) await say(u, 'guilty');
     await until(() => /Executioner wins/.test(gcFind(/found guilty/)), 5000);
     check('mm: executioner wins when their target is convicted', /Executioner wins/.test(gcFind(/found guilty/)), gcFind(/found guilty/).slice(0, 200));
+    check('mm: an innocent conviction gets a correction (newspaper image)', /\[file trial-1\.png \d{4,}B\]/.test(gcFind(/found guilty/)));
     await until(() => g.phase === 'night', 5000);
     await dmTo(alice, `kill ${frank.username}`);
     await until(() => /murderers win/.test(gcFind(/murderers win/)), 6000);
     const fin = gcFind(/murderers win/);
     check('mm: executioner listed as a co-winner', /Executioner also wins/.test(fin), fin.slice(0, 300));
+    await until(() => /timeline\.png/.test(gcFind(/how it happened/)), 8000);
+    check('mm: timeline image after the game', /\[file timeline\.png \d{4,}B\]/.test(gcFind(/how it happened/)));
     check('mm: bets settled at the end', /gina\*\* bet 🪙 100 on .+: won 🪙 320/.test(fin) && eco.balance(gina.id) === gina0 + 220 + 50, `${eco.balance(gina.id) - gina0}`); // +50 for playing
     check('mm: achievements unlocked', /Hanging Judge/.test(fin) && mm.stats(bob.id).achievements.includes('hanging_judge'), fin.split('Achievements')[1]?.slice(0, 200));
-    await until(() => !mm.games.has(h.channel.id) && !party.channelGame(h.channel), 3000);
+    await until(() => !mm.games.has(h.channel.id) && !party.channelGame(h.channel), 20000);
     check('mm: locks released after the game', !party.playingIn(alice.id) && !party.channelGame(h.channel));
     r = await say(alice, '!mm top');
     check('mm: leaderboard', /Mystery leaderboard/.test(r) && /alice/.test(r), r);
-    r = await say(bob, '!mm stats');
-    check('mm: stats show achievements', /Hanging Judge/.test(r), r);
+    await say(bob, '!mm stats');
+    await until(() => /bob's mystery record/.test(gcFind(/mystery record/)), 8000);
+    r = gcFind(/bob's mystery record/);
+    check('mm: stats show achievements', /Hanging Judge/.test(r), r.slice(0, 200));
+    check('mm: stats come with a profile card', /\[file mystery-profile\.png \d{4,}B\]/.test(r), r.slice(0, 60));
 
-    // Game B: quick mode, medium talks to the dead, spectator bet refunded when the host stops the game.
-    const four = [alice, bob, carol, dave];
+    // Game B: quick mode, custom cast, murder-team chat, medium talks to the dead, spectator bet refunded on stop.
+    const hank = { id: '199999999999999999', username: 'hank', bot: false, displayAvatarURL: () => null, toString() { return `<@${this.id}>`; } };
+    r = await say(bob, '!mm cast add Big Steve | the gym bro');
+    check('mm cast: only GC admins can edit', /Only GC admins/.test(r), r);
+    r = await say(alice, '!mm cast add Big Steve | the gym bro');
+    check('mm cast: add a custom character', /Added \*\*Big Steve\*\*, the gym bro/.test(r), r);
+    r = await say(alice, '!mm cast');
+    check('mm cast: list', /Custom cast · 1\/25/.test(r) && /Big Steve/.test(r), r);
+    r = await say(alice, '!mm howto');
+    await until(() => /how-to-play\.png/.test(gcFind(/How to play/)), 8000);
+    check('mm howto: guide image', /\[file how-to-play\.png \d{4,}B\]/.test(gcFind(/How to play/)), gcFind(/How to play/).slice(0, 60));
+
+    const sixB = [alice, bob, carol, dave, frank, gina];
+    await until(() => !party.channelGame(h.channel) && !mm.games.has(h.channel.id) && !party.playingIn(alice.id), 20000);
     await say(alice, '!mm');
-    for (const u of four.slice(1)) await say(u, '!mm join');
+    for (const u of sixB.slice(1)) await say(u, '!mm join');
     const g2 = mm.games.get(h.channel.id);
     r = await say(alice, '!mm mode quick');
     check('mm: mode set in the lobby', /Mode set to \*\*quick/.test(r) && g2.mode === 'quick', r);
-    g2.forceRoles = ['murderer', 'medium', 'guest', 'guest'];
+    g2.forceRoles = ['murderer', 'medium', 'guest', 'accomplice', 'guest', 'guest'];
     await say(alice, '!mm start');
-    for (const u of four) await dmTo(u, 'ready');
+    for (const u of sixB) await dmTo(u, 'ready');
     await until(() => g2.phase === 'night', 5000);
+    check('mm cast: custom characters are used', g2.players.some((p) => p.char.name === 'Big Steve'));
+    check('mm: murderer told about team chat', /anything else you DM me goes to your partner/.test(dmsFor(alice).filter((c) => /Night 1/.test(c)).at(-1) ?? ''));
+    await dmTo(alice, 'who should we hit tonight?');
+    check('mm: team chat reaches the partner', /🔪 \*\*.+\*\* \(alice\): who should we hit tonight\?/.test(lastDM(dave)) && /Sent to/.test(lastDM(alice)), lastDM(dave));
+    await dmTo(dave, 'say carol, she knows too much');
+    check('mm: `say` forces chat', /\(dave\): carol, she knows too much/.test(lastDM(alice)), lastDM(alice));
+    await dmTo(dave, 'skip');
     await dmTo(alice, `kill ${carol.username}`);
     await until(() => g2.phase === 'day', 5000);
-    const frank0 = eco.balance(frank.id);
-    r = await say(frank, '!mm bet alice 50');
-    check('mm: spectators can bet', /bets 🪙 50/.test(r) && eco.balance(frank.id) === frank0 - 50, r);
+    await until(() => /map-day-1\.png/.test(gcFind(/Investigation/)), 8000);
+    check('mm: day card comes with the floor plan', /\[file map-day-1\.png \d{4,}B\]/.test(gcFind(/Investigation/)), gcFind(/Investigation/).slice(0, 60));
+    r = await say(bob, '!mm map');
+    await until(() => /\[file map\.png/.test(gcFind(/floor plan/)), 8000);
+    check('mm map: floor plan on demand', /\[file map\.png \d{4,}B\]/.test(gcFind(/floor plan/)));
+    const hank0 = eco.balance(hank.id);
+    r = await say(hank, '!mm bet alice 50');
+    check('mm: spectators can bet', /bets 🪙 50/.test(r) && eco.balance(hank.id) === hank0 - 50, r);
     await say(alice, '!mm skip');
     await until(() => g2.phase === 'vote', 3000);
-    for (const u of [alice, bob, dave]) await say(u, '!vote skip');
+    for (const u of [alice, bob, dave, frank, gina]) await say(u, '!vote skip');
+    await until(() => /accusations-1\.png/.test(gcFind(/No trial today/)), 8000);
+    check('mm: accusation board after the vote', /\[file accusations-1\.png \d{4,}B\]/.test(gcFind(/No trial today/)), gcFind(/No trial today/).slice(0, 60));
     await until(() => g2.phase === 'night', 5000);
     await dmTo(bob, 'who did this to you?');
     check('mm: medium reaches the dead', /A medium reaches across:\*\* who did this to you\?/.test(lastDM(carol)), lastDM(carol));
@@ -451,7 +492,9 @@ module.exports = async function partyTests(h) {
     check('mm: the dead answer the medium', /👻 \*\*.+\*\* \(carol, Guest\): it was alice!!/.test(lastDM(bob)), lastDM(bob));
     await say(alice, '!mm stop');
     await until(() => !mm.games.has(h.channel.id), 3000);
-    check('mm: unsettled bets refunded when stopped', eco.balance(frank.id) === frank0, `${eco.balance(frank.id) - frank0}`);
+    check('mm: unsettled bets refunded when stopped', eco.balance(hank.id) === hank0, `${eco.balance(hank.id) - hank0}`);
+    r = await say(alice, '!mm cast clear');
+    check('mm cast: clear', /cleared/.test(r), r);
     Object.assign(process.env, saved);
   }
 };

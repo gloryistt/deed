@@ -12,6 +12,7 @@ const { SETTINGS, CHARACTERS, TRAITS, WEAPONS, ROLES, CLUE_INTROS, EVENTS, QUEST
 const { pick, shuffle, resolveUser, awaitReply } = require('../lib/util');
 const { card, color, ansiBlock } = require('../lib/format');
 const art = require('../lib/mystery-art');
+const cards = require('../lib/mystery-cards');
 
 const ROLE_COLORS = {
   murderer: '#e0253a', accomplice: '#fb923c', detective: '#60a5fa', doctor: '#34d399',
@@ -22,11 +23,18 @@ const NAME = 'Murder Mystery'; // for the shared party-game locks (one game per 
 const avatarOf = (p) => p.user.displayAvatarURL?.({ format: 'png', dynamic: false, size: 256 });
 
 // Post text with a generated image attached; if rendering fails, post the text alone.
-async function sayWithArt(g, text, render, name = 'mystery.png') {
+async function sendArt(channel, text, render, name = 'mystery.png') {
+  if (!channel) return null;
   let buffer = null;
   try { buffer = await Promise.race([render(), new Promise((_, rej) => setTimeout(() => rej(new Error('render timeout')), 12000))]); } catch (err) { console.error('[mystery art]', err.message); }
-  return g.channel.send(buffer ? { content: text, files: [{ attachment: buffer, name }] } : text).catch(() => {});
+  if (!buffer && !text) return null;
+  return channel.send(buffer ? { content: text, files: [{ attachment: buffer, name }] } : text).catch(() => {});
 }
+const sayWithArt = (g, text, render, name) => sendArt(g.channel, text, render, name);
+const weaponsOf = (g) => [...WEAPONS, ...(g.setting.weapons ?? [])];
+const capitalize = (t) => t.charAt(0).toUpperCase() + t.slice(1);
+// A dead guest's will, on parchment (skipped when the killer burned it).
+const postWill = (g, p) => p.will && sendArt(g.channel, `-# 📜 the last will of ${p.char.name}`, () => cards.will({ name: p.char.name, text: p.will }), `will-${p.id}.png`);
 
 const env = (k, d) => Number(process.env[k] ?? d);
 const T = {
@@ -154,7 +162,7 @@ function winner(g) {
 
 // After any death: lovers follow each other, an Executioner whose target died some other way becomes a
 // Jester, and if every murderer is gone an accomplice takes over the knife. Adds lines to `lines`.
-function aftermath(g, lines) {
+function aftermath(g, lines, { news = [], when = `Day ${g.day}` } = {}) {
   for (let changed = true; changed;) {
     changed = false;
     for (const p of g.players) {
@@ -163,7 +171,8 @@ function aftermath(g, lines) {
       lover.alive = false;
       changed = true;
       lines.push(`> 💔 **${lover.char.name}** couldn’t live without ${p.char.name} and died of a broken heart. They were the **${ROLES[lover.role].name}** ${ROLES[lover.role].emoji}.`, ...willLines(lover));
-      g.events.push(`Day ${g.day}: ${plain(lover)} (${ROLES[lover.role].name}) died of a broken heart after losing ${plain(p)}.`);
+      g.events.push(`${when}: ${plain(lover)} (${ROLES[lover.role].name}) died of a broken heart after losing ${plain(p)}.`);
+      news.push({ title: 'A broken heart', text: `${lover.char.name} could not live without ${p.char.name}.` });
     }
   }
   for (const exe of alive(g).filter((x) => x.role === 'executioner' && !x.exeWon)) {
@@ -175,7 +184,10 @@ function aftermath(g, lines) {
     }
   }
   const heir = promoteAccomplice(g);
-  if (heir) lines.push('', '> 🔪 *Somewhere in the house, someone picks up the knife…* (the killing isn’t over)');
+  if (heir) {
+    lines.push('', '> 🔪 *Somewhere in the house, someone picks up the knife…* (the killing isn’t over)');
+    news.push({ title: 'Not over yet', text: 'Witnesses report someone quietly picking up the knife.' });
+  }
 }
 
 // If every murderer is gone but an accomplice lives, they take over the knife.
@@ -206,6 +218,22 @@ function roleCard(g, p) {
     `> ${r.how}${p.role === 'survivor' ? ` (${p.vests ?? 0} left)` : ''}`,
     `-# ${g.setting.emoji} ${g.setting.name} · keep this secret · DM me \`role\` anytime · \`will <text>\` to leave a last will`,
   ].filter(Boolean).join('\n');
+}
+
+// The secret dossier image that goes with the role card.
+function dossierFor(g, p) {
+  const r = ROLES[p.role];
+  const partners = isMurderTeam(p) ? g.players.filter((x) => isMurderTeam(x) && x !== p) : [];
+  const notes = [
+    partners.length ? `PARTNER${partners.length > 1 ? 'S' : ''}: ${partners.map((x) => `${x.char.name} (${x.user.username})`).join(', ')}` : null,
+    p.role === 'executioner' && p.exeTarget ? `TARGET: ${byId(g, p.exeTarget).char.name} (${byId(g, p.exeTarget).user.username})` : null,
+    p.lover ? `IN LOVE WITH: ${byId(g, p.lover).char.name} (${byId(g, p.lover).user.username})` : null,
+  ].filter(Boolean);
+  return cards.dossier({
+    setting: g.setting.name, name: p.char.name, title: p.char.title, user: p.user.username, url: avatarOf(p),
+    role: r.name, roleColor: ROLE_COLORS[p.role], goal: r.goal,
+    traits: [p.traits.garment[0], p.traits.scent[0], p.traits.mark[0]], notes,
+  });
 }
 
 function stats(userId) {
@@ -244,9 +272,10 @@ const nightAction = (p) => (p.role === 'vigilante' && p.usedShot ? null : ROLES[
 function nightPrompt(g, p) {
   const action = ROLES[p.role].night;
   const extras = p.role === 'murderer'
-    ? `\n-# also: ${p.usedFrame ? '~~frame~~ (used)' : '`frame <#>`'} · ${p.usedClean ? '~~clean~~ (used)' : '`clean`'} · weapons: ${WEAPONS.map((w) => w[0].split(' ').pop()).join(', ')}`
+    ? `\n-# also: ${p.usedFrame ? '~~frame~~ (used)' : '`frame <#>`'} · ${p.usedClean ? '~~clean~~ (used)' : '`clean`'} · weapons: ${weaponsOf(g).map((w) => w[0].split(' ').pop()).join(', ')}`
     : p.role === 'accomplice' || p.role === 'vigilante' ? '\n-# or `skip`' : '';
-  return `### ${ROLES[p.role].emoji} Night ${g.day}\n> Reply \`${action} <number or name>\`:\n${numbered(g, TARGET_FILTERS[action](p)).split('\n').map((l) => `> ${l}`).join('\n')}${extras}`;
+  const team = isMurderTeam(p) && alive(g).some((x) => isMurderTeam(x) && x !== p) ? '\n-# 🤫 anything else you DM me goes to your partner' : '';
+  return `### ${ROLES[p.role].emoji} Night ${g.day}\n> Reply \`${action} <number or name>\`:\n${numbered(g, TARGET_FILTERS[action](p)).split('\n').map((l) => `> ${l}`).join('\n')}${extras}${team}`;
 }
 
 dm.onDM(async (client, message) => {
@@ -355,13 +384,23 @@ dm.onDM(async (client, message) => {
     return true;
   }
 
+  // Murder-team chat: anything that isn't an action goes to the rest of the team (or force it with `say …`).
+  const partners = isMurderTeam(p) ? alive(g).filter((x) => isMurderTeam(x) && x !== p) : [];
+  const isCommand = new RegExp(`^(${action}|frame|clean|skip)\\b`, 'i').test(text) || findTarget(g, text.replace(/\s+with\s+.+$/i, ''), TARGET_FILTERS[action](p));
+  if (partners.length && (/^say\s+/i.test(text) || !isCommand)) {
+    const msg = sanitize(text.replace(/^say\s+/i, '')).slice(0, 400);
+    for (const x of partners) x.dmChannel?.send(`🔪 **${p.char.name}** (${p.user.username}): ${msg}`).catch(() => {});
+    await reply(`🤫 Sent to ${partners.map((x) => x.char.name).join(', ')}.`);
+    return true;
+  }
+
   const m = new RegExp(`^(?:${action}\\s+)?(.+?)(?:\\s+with\\s+(.+))?$`, 'i').exec(text);
   const target = m && findTarget(g, m[1], TARGET_FILTERS[action](p));
   if (!target) { await reply(nightPrompt(g, p)); return true; }
 
   if (action === 'kill') {
     const weaponWord = m[2]?.toLowerCase();
-    const weapon = weaponWord ? WEAPONS.find((w) => w[0].includes(weaponWord)) : null;
+    const weapon = weaponWord ? weaponsOf(g).find((w) => w[0].includes(weaponWord)) : null;
     n.kill = target.id;
     n.killer = p.id;
     n.weapon = weapon ?? n.weapon;
@@ -447,7 +486,9 @@ function roleList(n, mode = 'classic') {
 
 function assignRoles(g) {
   const shuffledRoles = g.forceRoles ?? shuffle(roleList(g.players.length, g.mode));
-  const chars = shuffle([...CHARACTERS]);
+  // The GC's custom cast (mm cast) is used first, then the built-in characters.
+  const custom = shuffle([...(data.mmCast?.[g.channel.id] ?? [])]);
+  const chars = [...custom, ...shuffle(CHARACTERS.filter(([name]) => !custom.some(([c]) => c.toLowerCase() === name.toLowerCase())))];
   const traitPools = Object.fromEntries(Object.entries(TRAITS).map(([k, v]) => [k, shuffle([...v])]));
   g.players.forEach((p, i) => {
     p.role = shuffledRoles[i];
@@ -476,7 +517,7 @@ function assignRoles(g) {
 
 async function prologue(g) {
   const s = g.setting;
-  const weapon = pick(WEAPONS);
+  const weapon = pick(weaponsOf(g));
   const room = pick(s.rooms);
   const culprit = pick(g.players.filter((p) => p.role === 'murderer'));
   const clue = makeClue(g, { culprit, truth: 0.6, options: 3 });
@@ -522,7 +563,8 @@ async function nightPhase(g) {
     const det = byId(g, detId), target = byId(g, targetId);
     const suspicious = target.role === 'murderer' || n.frames.has(target.id);
     if (target.role === 'murderer') { award(det, 2); det.foundMurderer = true; }
-    det.dmChannel?.send(`### 🔍 Dawn report: ${label(target)} looks ${suspicious ? '**SUSPICIOUS** 🔪' : '**innocent** 😇'}\n-# framed people look suspicious, and the accomplice looks innocent`).catch(() => {});
+    sendArt(det.dmChannel, `### 🔍 Dawn report: ${label(target)} looks ${suspicious ? '**SUSPICIOUS** 🔪' : '**innocent** 😇'}\n-# framed people look suspicious, and the accomplice looks innocent`,
+      () => cards.caseFile({ night: g.day, subject: target.char.name, user: target.user.username, url: avatarOf(target), suspicious }), 'case-file.png');
   }
 
   // Who dies. Idle murderers still strike, at random.
@@ -531,23 +573,29 @@ async function nightPhase(g) {
   if (!victim?.alive) victim = pick(alive(g).filter((p) => !isMurderTeam(p)));
   const killer = byId(g, n.killer) ?? pick(murderers);
   n.visits.set(killer.id, victim.id);
-  const weapon = n.weapon ?? pick(WEAPONS);
+  const weapon = n.weapon ?? pick(weaponsOf(g));
   const room = pick(s.rooms);
   g.lastRoom = room;
+  (g.scenes ??= []).push({ room, night: g.day });
+  const before = new Set(alive(g));
+  const news = []; // side stories for the morning paper
 
   // Witness reports: who left their room, and where they went. Frames don't matter here.
   for (const [witId, targetId] of n.watches) {
     const wit = byId(g, witId), target = byId(g, targetId);
     const went = n.visits.has(target.id) ? byId(g, n.visits.get(target.id)) : null;
     if (went && isMurderTeam(target)) award(wit, 2);
-    wit.dmChannel?.send(went
+    sendArt(wit.dmChannel, went
       ? `### 👁️ Dawn report: ${label(target)} **left their room** in the night\n> You saw them slip into ${label(went)}’s room.\n-# every night role moves around, not only killers`
-      : `### 👁️ Dawn report: ${label(target)} **never left their room**`).catch(() => {});
+      : `### 👁️ Dawn report: ${label(target)} **never left their room**`,
+    () => cards.cctv({ night: g.day, subject: target.char.name, url: avatarOf(target), went: went?.char.name ?? null }), 'cctv.png');
   }
 
-  const events = EVENTS.filter((e) => alive(g).length >= (e.min ?? 0));
+  const events = [...(s.events ?? []), ...EVENTS].filter((e) => alive(g).length >= (e.min ?? 0));
   const event = process.env.MM_EVENTS === 'off' ? null : events.find((e) => Math.random() < e.chance * (g.mode === 'chaos' ? 2.5 : 1));
-  const noClues = n.clean || event?.id === 'outage';
+  const effect = event?.effect ?? event?.id; // setting events reuse the standard effects with their own story
+  if (event) news.push({ title: 'Strange night', text: event.text.replace(/\*\*/g, '').replace(/^\S+\s/u, '') });
+  const noClues = n.clean || effect === 'outage';
   const bodyguard = [...n.guards].find(([, t]) => t === victim.id)?.[0];
 
   await say(g, `### 🌅 Morning\n> *${pick(s.morning)}*${event ? `\n> ${event.text}` : ''}`);
@@ -566,6 +614,7 @@ async function nightPhase(g) {
     const c = makeClue(g, { culprit: killer, anchor: killer, options: 2 });
     lines.push('', clueText(c));
     g.events.push(`Night ${g.day}: ${plain(dead)} (Bodyguard) died protecting ${plain(victim)} from ${plain(killer)}.`);
+    (killer.victims ??= []).push(dead.char.name);
   } else if (n.protects.has(victim.id) || n.vests.has(victim.id)) {
     for (const doc of alive(g).filter((x) => x.role === 'doctor' && n.visits.get(x.id) === victim.id)) { award(doc, 3); doc.saves = (doc.saves ?? 0) + 1; }
     lines.push('### 💉 A close call', n.protects.has(victim.id)
@@ -582,6 +631,7 @@ async function nightPhase(g) {
     lines.push(`### ⚰️ ${victim.char.name} is dead`, `> ${label(victim)} is found in the **${room}**, ${weapon[1]}.`,
       `> They were the **${ROLES[victim.role].name}** ${ROLES[victim.role].emoji}.`, ...willLines(victim, n.clean && !!victim.will));
     g.events.push(`Night ${g.day}: ${plain(victim)} (${ROLES[victim.role].name}) was ${weapon[1]} in the ${room} by ${plain(killer)}${n.clean ? ' (cleaned up)' : ''}${n.frameClue ? `, framing ${plain(byId(g, n.frameClue))}` : ''}.`);
+    (killer.victims ??= []).push(victim.char.name);
     if (!noClues) {
       const clueCount = g.players.length >= 6 ? 2 : 1;
       const first = makeClue(g, { culprit: killer, anchor: n.frameClue ? byId(g, n.frameClue) : null });
@@ -591,14 +641,15 @@ async function nightPhase(g) {
       lines.push('', '> 🧹 The scene is spotless. Whoever did this cleaned up.');
     }
   }
-  if (event?.id === 'seance' && dead) lines.push(clueText(makeClue(g, { culprit: killer, truth: 0.85, options: 2, intro: `👻 ${dead.char.name}’s ghost whispers that the killer:` })));
-  if (event?.id === 'dog') lines.push(clueText(makeClue(g, { culprit: killer, truth: 0.6, options: 2, intro: `🐕 The dog was barking at someone who:` })));
-  if (event?.id === 'diary') {
+  if (effect === 'seance' && dead) lines.push(clueText(makeClue(g, { culprit: killer, truth: 0.85, options: 2, intro: event.intro ?? `👻 ${dead.char.name}’s ghost whispers that the killer:` })));
+  if (effect === 'dog') lines.push(clueText(makeClue(g, { culprit: killer, truth: 0.6, options: 2, intro: event.intro ?? '🐕 The dog was barking at someone who:' })));
+  if (effect === 'diary') {
     const cleared = pick(alive(g).filter((p) => !isMurderTeam(p) && !p.cleared));
     if (cleared) {
       cleared.cleared = true;
       lines.push(`> 📖 *“${cleared.char.name} could never hurt a soul.”* ${label(cleared)} is **not** a killer.`);
       g.events.push(`Night ${g.day}: a diary page cleared ${plain(cleared)}.`);
+      news.push({ title: 'Diary page found', text: `A torn page in the host’s own hand clears ${cleared.char.name} of any wrongdoing.` });
     }
   }
 
@@ -610,36 +661,46 @@ async function nightPhase(g) {
     if (n.protects.has(target.id) || n.vests.has(target.id)) {
       lines.push('', '### 🔫 A gunshot at dawn', `> Someone fired at ${label(target)}, but they survived.`);
       g.events.push(`Night ${g.day}: ${plain(vig)} (Vigilante) shot at ${plain(target)}, who survived.`);
+      news.push({ title: 'Gunshot at dawn', text: `Someone fired at ${target.char.name}, who somehow survived.` });
       continue;
     }
     target.alive = false;
     lines.push('', '### 🔫 A gunshot at dawn', `> ${label(target)} was shot dead. They were the **${ROLES[target.role].name}** ${ROLES[target.role].emoji}.`, ...willLines(target));
     g.events.push(`Night ${g.day}: ${plain(vig)} (Vigilante) shot ${plain(target)} (${ROLES[target.role].name}).`);
+    news.push({ title: 'Gunshot at dawn', text: `${target.char.name} was shot dead before sunrise. They were the ${ROLES[target.role].name}.` });
     if (isMurderTeam(target)) { award(vig, 4); vig.vigKill = true; }
     else if (team(target) === 'town' && vig.alive) {
       vig.alive = false;
       lines.push(`> 😔 **${vig.char.name}**, the Vigilante, couldn’t live with what they’d done.`, ...willLines(vig));
       g.events.push(`Night ${g.day}: ${plain(vig)} (Vigilante) died of guilt.`);
+      news.push({ title: 'Overcome with guilt', text: `${vig.char.name}, who fired the shot, could not live with it.` });
     }
   }
-  aftermath(g, lines);
+  aftermath(g, lines, { news, when: `Night ${g.day}` });
 
+  // The morning paper.
   const shown = dead ?? victim;
   const kind = !dead ? 'saved' : dead.role === 'bodyguard' && dead !== victim ? 'hero' : 'dead';
-  await sayWithArt(g, lines.join('\n'), () => art.sceneCard({
-    kind,
-    headline: `Night ${g.day} · ${s.name}`,
-    name: shown.char.name,
-    subtitle: `@${shown.user.username} · ${shown.char.title}`,
-    role: dead ? ROLES[dead.role].name : null,
-    roleColor: dead ? ROLE_COLORS[dead.role] : null,
-    lines: kind === 'saved'
-      ? [`Attacked in the ${room}`, 'but someone got there just in time']
-      : kind === 'hero' ? [`Took the blow meant for ${victim.char.name}`, `in the ${room}`, willExcerpt(dead)].filter(Boolean)
-        : [`Found in the ${room}`, weapon[1], willExcerpt(dead, n.clean)].filter(Boolean),
-    avatarUrl: avatarOf(shown),
-    footer: `${alive(g).length} guests remain`,
+  const who = `${shown.char.name}, ${shown.char.title}`;
+  const headline = kind === 'saved' ? `${capitalize(shown.char.title)} survives attack in the ${room}`
+    : kind === 'hero' ? `Bodyguard dies saving ${victim.char.name}` : `${capitalize(shown.char.title)} found dead in the ${room}`;
+  const lead = kind === 'saved'
+    ? [`${who}, was attacked in the ${room} overnight and lived to tell the tale${n.vests.has(victim.id) ? ', saved by a bulletproof vest' : ''}.`, 'The attacker remains at large. Guests are advised to lock their doors.']
+    : [`${who}, was found in the ${room} this morning, ${weapon[1]}. ${kind === 'hero' ? `They died shielding ${victim.char.name}. They` : 'They'} were the ${ROLES[dead.role].name}.`,
+      n.clean ? 'The scene had been scrubbed spotless, and the will was torn to shreds.' : noClues ? 'In the darkness, investigators found nothing useful.' : 'Investigators found fresh evidence at the scene.',
+      dead.will && !(n.clean && kind === 'dead') ? 'A last will was found on the body (see below).' : `${alive(g).length} guests remain.`];
+  await sayWithArt(g, lines.join('\n'), () => cards.newspaper({
+    paper: s.paper ?? `The ${s.name} Gazette`,
+    dateline: `Night ${g.day} · ${s.name} · ${alive(g).length} guests remain`,
+    headline,
+    photo: { url: avatarOf(shown), name: shown.char.name, caption: `${who} (@${shown.user.username}).`, gray: kind !== 'saved' },
+    lead,
+    sidebars: news,
+    stamp: kind === 'saved' ? { text: 'SURVIVED', color: '#1f7a46' } : kind === 'hero' ? { text: 'HERO', color: '#1d4ed8' } : null,
   }), `night-${g.day}.png`);
+  for (const p of g.players.filter((x) => before.has(x) && !x.alive)) {
+    if (!(p === victim && n.clean)) await postWill(g, p);
+  }
 }
 
 async function dayPhase(g) {
@@ -647,18 +708,25 @@ async function dayPhase(g) {
   g.skip = false;
   g.searched = new Map(); // room -> player who searched it today
   const ms = pace(g, T.day(alive(g).length));
-  await say(g, card({
+  await sayWithArt(g, card({
     title: `Day ${g.day} · Investigation`, emoji: '☀️',
     body: [
       'Cross-check the clues against the guests’ traits. Accuse, defend, lie.',
       `🔍 Everyone alive can **\`mm search <room>\`** once today, and each room can only be searched once. Rooms: ${g.setting.rooms.join(', ')}.`,
       g.lastRoom ? `-# last night’s scene: the ${g.lastRoom} (best odds of evidence)` : null,
       '🔦 Once a day, someone can `mm question <guest>` to put them on the spot.',
-      '-# 🎩 a Mayor can `mm reveal` · 👻 the dead can DM me `haunt <#>` once · 🎰 the dead and spectators can `mm bet <guest> <coins>` · `mm board`',
+      '-# 🎩 a Mayor can `mm reveal` · 👻 the dead can DM me `haunt <#>` once · 🎰 the dead and spectators can `mm bet <guest> <coins>` · `mm board` · `mm map`',
     ],
     footer: `accusations open in ${secs(ms)} · host can \`mm skip\` · ${alive(g).length} alive · \`mm clues\``,
-  }));
+  }), () => renderMap(g), `map-day-${g.day}.png`);
   await waitFor(g, () => g.skip, ms);
+}
+
+function renderMap(g) {
+  return cards.floorPlan({
+    setting: g.setting.name, day: g.day, rooms: g.setting.rooms, scene: g.lastRoom, scenes: g.scenes ?? [],
+    searched: Object.fromEntries([...(g.searched ?? new Map())].map(([room, p]) => [room, p.char.name])),
+  });
 }
 
 function tally(g) {
@@ -713,18 +781,27 @@ async function votePhase(g) {
   const counts = [...tally(g).entries()].filter(([id]) => id !== 'skip').sort((a, b) => b[1] - a[1]);
   const [top, second] = counts;
   const skips = tally(g).get('skip') ?? 0;
-  if (!top || top[1] < accusationsNeeded(g) || (second && second[1] === top[1]) || skips >= top[1]) {
+  const noTrial = !top || top[1] < accusationsNeeded(g) || (second && second[1] === top[1]) || skips >= top[1];
+  // Who accused whom, drawn as red strings.
+  const board = () => cards.accusationBoard({
+    day: g.day,
+    players: alive(g).map((p) => ({ id: p.id, name: p.char.name, url: avatarOf(p) })),
+    votes: [...g.votes.entries()],
+    result: noTrial ? 'No trial today' : `${byId(g, top[0]).char.name} goes to trial`,
+  });
+  if (noTrial) {
     g.events.push(`Day ${g.day}: nobody got enough accusations for a trial.`);
-    return say(g, `### ⚖️ No trial today\n> ${!top ? 'Nobody was accused.' : `Not enough agreement (needed ${accusationsNeeded(g)} votes, no ties).`}`);
+    return sayWithArt(g, `### ⚖️ No trial today\n> ${!top ? 'Nobody was accused.' : `Not enough agreement (needed ${accusationsNeeded(g)} votes, no ties).`}`, board, `accusations-${g.day}.png`);
   }
-  return trialPhase(g, byId(g, top[0]));
+  return trialPhase(g, byId(g, top[0]), board);
 }
 
-async function trialPhase(g, accused) {
+async function trialPhase(g, accused, board = null) {
   g.trial = { accused, votes: new Map() };
   g.phase = 'defense';
   accused.trials = (accused.trials ?? 0) + 1;
-  await say(g, `### ⚖️ ${accused.char.name} is on trial!\n> <@${accused.id}>, you have **${secs(pace(g, T.defense()))}** to defend yourself. Everyone else: listen.`);
+  const onTrial = `### ⚖️ ${accused.char.name} is on trial!\n> <@${accused.id}>, you have **${secs(pace(g, T.defense()))}** to defend yourself. Everyone else: listen.`;
+  if (board) await sayWithArt(g, onTrial, board, `accusations-${g.day}.png`); else await say(g, onTrial);
   await waitFor(g, () => false, pace(g, T.defense()));
   g.phase = 'trial';
   g.trialMsg = await g.channel.send(trialBoard(g).text);
@@ -778,11 +855,28 @@ async function trialPhase(g, accused) {
     g.events.push(`Day ${g.day}: ${plain(exe)} (Executioner) got their target convicted.`);
   }
   aftermath(g, lines);
-  return sayWithArt(g, lines.join('\n'), () => art.sceneCard({
-    kind: 'guilty', headline: `Day ${g.day} · The trial`, name: accused.char.name, subtitle: `@${accused.user.username} · ${accused.char.title}`,
-    role: accused.role === 'jester' ? 'Jester · wins!' : r.name, roleColor: ROLE_COLORS[accused.role],
-    lines: [`Convicted ${guilty} to ${innocent}`, isMurderTeam(accused) ? 'caught red-handed' : 'an innocent guest…', willExcerpt(accused)].filter(Boolean), avatarUrl: avatarOf(accused),
-  }), `trial-${g.day}.png`);
+  // Killers get a WANTED poster, innocents a front-page correction, the Jester their victory card.
+  const render = isMurderTeam(accused)
+    ? () => cards.wanted({ name: accused.char.name, user: accused.user.username, role: r.name, url: avatarOf(accused), crimes: accused.victims ?? [], reward: `${WIN_REWARD} COINS` })
+    : accused.role !== 'jester'
+      ? () => cards.newspaper({
+        paper: g.setting.paper ?? `The ${g.setting.name} Gazette`,
+        dateline: `Day ${g.day} · ${g.setting.name} · correction`,
+        headline: `Innocent ${accused.char.title.replace(/^the /, '')} convicted`,
+        photo: { url: avatarOf(accused), name: accused.char.name, caption: `${accused.char.name} (@${accused.user.username}), led away to the cellar.` },
+        lead: [`${accused.char.name} was convicted ${guilty}–${innocent} yesterday and dragged off to the cellar. They were the ${r.name}, and entirely innocent.`, 'The real killer is still among the guests. This paper regrets the error.'],
+        sidebars: lines.some((l) => /broken heart/.test(l)) ? [{ title: 'A broken heart', text: 'Their lover did not survive the news.' }] : [],
+        stamp: { text: 'CORRECTION', color: '#b3202a' },
+      })
+      : () => art.sceneCard({
+        kind: 'guilty', headline: `Day ${g.day} · The trial`, name: accused.char.name, subtitle: `@${accused.user.username} · ${accused.char.title}`,
+        role: 'Jester · wins!', roleColor: ROLE_COLORS.jester,
+        lines: [`Convicted ${guilty} to ${innocent}`, 'and laughing about it', willExcerpt(accused)].filter(Boolean), avatarUrl: avatarOf(accused),
+      });
+  const out = await sayWithArt(g, lines.join('\n'), render, `trial-${g.day}.png`);
+  await postWill(g, accused);
+  for (const p of g.players.filter((x) => x !== accused && !x.alive && x.lover === accused.id && x.will)) await postWill(g, p);
+  return out;
 }
 
 const ACHIEVEMENTS = {
@@ -831,6 +925,8 @@ async function finale(g, side) {
   for (const p of g.players) {
     const s = stats(p.id);
     s.name = p.user.username;
+    s.roles ??= {};
+    s.roles[p.startRole] = (s.roles[p.startRole] ?? 0) + 1;
     s.games++;
     if (p.startRole === 'murderer' || p.role === 'murderer') s.murderer++;
     if (winners.includes(p)) s.wins++;
@@ -878,6 +974,28 @@ async function finale(g, side) {
       alive: p.alive, avatarUrl: avatarOf(p), mvp: p === mvp, winner: winners.includes(p),
     })),
   }), 'game-over.png');
+  await sayWithArt(g, '-# 🎬 how it happened', () => cards.timeline({ setting: g.setting.name, side, rounds: timelineRounds(g) }), 'timeline.png');
+}
+
+// Turn the event log ("Night 2: …", "Day 2: …") into timeline columns, colored by what happened.
+const EVENT_KINDS = [
+  [/Bodyguard\) died protecting/, 'hero'], [/broken heart/, 'heartbreak'], [/died of guilt/, 'guilt'], [/\(Vigilante\) shot/, 'shot'],
+  [/saved them|who survived/, 'save'], [/was convicted/, 'convict'], [/found innocent/, 'acquit'], [/nobody got enough/, 'notrial'],
+  [/Mayor/, 'reveal'], [/Executioner/, 'exe'], [/destroyed the evidence/, 'clean'], [/ was .+ by |^Prologue/, 'kill'],
+];
+function timelineRounds(g) {
+  const rounds = [];
+  const byLabel = new Map();
+  for (const e of g.events) {
+    const m = /^(Prologue|Night \d+|Day \d+):\s*(.*)$/.exec(e);
+    if (!m) continue;
+    let r = byLabel.get(m[1]);
+    if (!r) { r = { label: m[1], night: !/^Day/.test(m[1]), items: [] }; byLabel.set(m[1], r); rounds.push(r); }
+    // Drop the "(username)" after each character name; keep roles like "(Detective)".
+    const text = g.players.reduce((t, p) => t.split(` (${p.user.username})`).join(''), m[2]).slice(0, 160);
+    if (r.items.length < 6) r.items.push({ kind: (EVENT_KINDS.find(([re]) => re.test(e)) ?? [null, 'event'])[1], text });
+  }
+  return rounds;
 }
 
 async function runGame(g) {
@@ -889,7 +1007,7 @@ async function runGame(g) {
       return;
     }
     assignRoles(g);
-    for (const p of g.players) await p.dmChannel?.send(roleCard(g, p)).catch(() => {});
+    for (const p of g.players) await sendArt(p.dmChannel, roleCard(g, p), () => dossierFor(g, p), 'dossier.png');
     await prologue(g);
     for (;;) {
       // The murderer always gets a night before the first vote.
@@ -970,7 +1088,7 @@ module.exports = [
   {
     name: 'mystery',
     aliases: ['mm', 'murder', 'murdermystery'],
-    usage: 'mm [join | leave | start [quick|chaos] | stop | skip | search <room> | question <guest> | reveal | board | bet <guest> <coins> | clues | guests | roles | stats | top]',
+    usage: 'mm [join | leave | start [quick|chaos] | stop | skip | search <room> | question <guest> | reveal | board | map | bet <guest> <coins> | clues | guests | roles | howto | stats | top | cast]',
     description: 'Murder mystery: secret roles by DM, murders, clues, searches, trials (4–25 players). Modes: classic, quick, chaos.',
     async run({ client, message, args, config }) {
       const p = config.prefix;
@@ -983,7 +1101,8 @@ module.exports = [
       if (sub === 'stats') {
         const user = (await resolveUser(client, message, args[1])) ?? me;
         const s = stats(user.id);
-        return ch.send(card({
+        const fav = Object.entries(s.roles ?? {}).sort((a, b) => b[1] - a[1])[0]?.[0];
+        return sendArt(ch, card({
           title: `${user.username}'s mystery record`, emoji: '🔪',
           body: [
             `🎮 **${s.games}** games · 🏆 **${s.wins}** wins (${s.games ? Math.round((s.wins / s.games) * 100) : 0}%)`,
@@ -991,7 +1110,46 @@ module.exports = [
             `⚖️ **${s.convictions}** murderers convicted`,
             `🏆 Achievements (${s.achievements.length}/${Object.keys(ACHIEVEMENTS).length}): ${s.achievements.length ? s.achievements.map((id) => `${ACHIEVEMENTS[id][0]} ${ACHIEVEMENTS[id][1]}`).join(' · ') : 'none yet'}`,
           ],
-        }));
+        }), () => cards.profileCard({
+          user: user.username, url: user.displayAvatarURL?.({ format: 'png', dynamic: false, size: 256 }), s,
+          favorite: fav ? { name: ROLES[fav].name, color: ROLE_COLORS[fav] } : null,
+          achievements: Object.entries(ACHIEVEMENTS).map(([id, [emoji, name]]) => [id, emoji, name, s.achievements.includes(id)]),
+        }), 'mystery-profile.png');
+      }
+      if (sub === 'howto' || sub === 'rules' || sub === 'tutorial') {
+        return sendArt(ch, `### 🔪 How to play\n> Start a lobby with \`${p}mm\`, everyone joins with \`${p}mm join\`, the host runs \`${p}mm start\`. Then everyone DMs me \`ready\`.\n-# \`${p}mm roles\` explains every role`, () => cards.howto({ prefix: p }), 'how-to-play.png');
+      }
+      if (sub === 'cast') {
+        data.mmCast ??= {};
+        const list = (data.mmCast[ch.id] ??= []);
+        const action = (args[1] ?? 'list').toLowerCase();
+        const clean = (t, max) => sanitize(t).replace(/[*_`~|>#\\]/g, '').trim().slice(0, max);
+        if (action === 'list') {
+          return ch.send(list.length
+            ? card({ title: `Custom cast · ${list.length}/25`, emoji: '🎭', body: list.map(([n, t], i) => `\`${i + 1}\` **${n}**, ${t}`), footer: `${p}mm cast add Name | title · ${p}mm cast remove <#> · ${p}mm cast clear · used before the built-in characters` })
+            : `### 🎭 Custom cast\n> None yet. GC admins can add characters: \`${p}mm cast add Name | title\`\n-# custom characters are handed out first, then the built-in ones`);
+        }
+        if (!config.isAdmin(me.id, client) && !onboarding.isGcManager(ch, me.id)) return message.reply('Only GC admins can change the cast.');
+        if (action === 'add') {
+          const [rawName = '', rawTitle = ''] = args.slice(2).join(' ').split('|');
+          const name = clean(rawName, 32), title = clean(rawTitle, 40) || 'the mysterious guest';
+          if (!name) return message.reply(`Usage: \`${p}mm cast add Name | title\` (e.g. \`${p}mm cast add Big Steve | the gym bro\`)`);
+          if (list.length >= 25) return message.reply('The cast is full (25). Remove someone first.');
+          if (list.some(([n]) => n.toLowerCase() === name.toLowerCase())) return message.reply(`**${name}** is already in the cast.`);
+          list.push([name, title]);
+          save();
+          return message.reply(`🎭 Added **${name}**, ${title}. (${list.length}/25)`);
+        }
+        if (action === 'remove' || action === 'rm') {
+          const q = args.slice(2).join(' ').toLowerCase();
+          const i = /^\d+$/.test(q) ? Number(q) - 1 : list.findIndex(([n]) => n.toLowerCase() === q);
+          if (!list[i]) return message.reply('Remove who? Use the number from `mm cast`.');
+          const [gone] = list.splice(i, 1);
+          save();
+          return message.reply(`🎭 Removed **${gone[0]}**.`);
+        }
+        if (action === 'clear') { list.length = 0; save(); return message.reply('🎭 Custom cast cleared. Back to the built-in characters.'); }
+        return message.reply(`\`${p}mm cast [list | add Name | title | remove <#> | clear]\``);
       }
       if (sub === 'top' || sub === 'leaderboard' || sub === 'lb') {
         const by = ['wins', 'kills', 'convictions', 'games'].includes(args[1]) ? args[1] : 'wins';
@@ -1092,6 +1250,10 @@ module.exports = [
         g.events.push(`Day ${g.day}: ${plain(player)} revealed themselves as the Mayor.`);
         if (g.phase === 'trial') g.trialMsg?.edit(trialBoard(g).text).catch(() => {});
         return ch.send(`### 🎩 ${player.char.name} is the Mayor!\n> ${label(player)} stands on a chair and produces the deed to the house. Their verdict at trials now counts **triple**.\n-# …and the killer knows exactly who they are now`);
+      }
+      if (sub === 'map') {
+        if (!g.players[0].char || !g.day) return message.reply('The floor plan goes up after the first night.');
+        return sayWithArt(g, `### 🗺️ ${g.setting.name} · floor plan`, () => renderMap(g), 'map.png');
       }
       if (sub === 'board') {
         if (!g.players[0].char) return message.reply('The board goes up once the game starts.');

@@ -817,7 +817,10 @@ async function main() {
     const mmDMs = [];
     const dmTo = async (user, content) => {
       if (!QUIET) console.log(`\n✉️  ${user.username} → Deed (DM): ${content}`);
-      await dmRouter.route(client, { id: nextId(), content, author: user, channel: { type: 'DM', send: async (c) => { mmDMs.push({ to: user, content: c }); out(c, 'dm'); } } });
+      await dmRouter.route(client, { id: nextId(), content, author: user, channel: { type: 'DM', send: async (c) => {
+        const content = typeof c === 'object' ? `[file ${c.files?.[0]?.name} ${c.files?.[0]?.attachment?.length ?? 0}B]${c.content ? ` ${c.content}` : ''}` : c;
+        mmDMs.push({ to: user, content }); out(content, 'dm');
+      } } });
       await settle();
     };
     const dmsFor = (u) => mmDMs.filter((d) => d.to === u).map((d) => d.content);

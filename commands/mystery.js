@@ -1088,7 +1088,7 @@ module.exports = [
   {
     name: 'mystery',
     aliases: ['mm', 'murder', 'murdermystery'],
-    usage: 'mm [join | leave | start [quick|chaos] | stop | skip | search <room> | question <guest> | reveal | board | map | bet <guest> <coins> | clues | guests | roles | howto | stats | top | cast]',
+    usage: 'mm [join | leave | start [quick|chaos] | stop | skip | search <room> | question <guest> | reveal | board | map | bet <guest> <coins> | clues | guests | roles | howto | stats | achievements | top | cast]',
     description: 'Murder mystery: secret roles by DM, murders, clues, searches, trials (4–25 players). Modes: classic, quick, chaos.',
     async run({ client, message, args, config }) {
       const p = config.prefix;
@@ -1150,6 +1150,16 @@ module.exports = [
         }
         if (action === 'clear') { list.length = 0; save(); return message.reply('🎭 Custom cast cleared. Back to the built-in characters.'); }
         return message.reply(`\`${p}mm cast [list | add Name | title | remove <#> | clear]\``);
+      }
+      if (sub === 'achievements' || sub === 'ach') {
+        const user = (await resolveUser(client, message, args[1])) ?? me;
+        const s = stats(user.id);
+        const got = Object.keys(ACHIEVEMENTS).filter((id) => s.achievements.includes(id)).length;
+        return ch.send(card({
+          title: `${user.username}'s achievements · ${got}/${Object.keys(ACHIEVEMENTS).length}`, emoji: '🏆',
+          body: Object.entries(ACHIEVEMENTS).map(([id, [emoji, name, how]]) => `${s.achievements.includes(id) ? '✅' : '🔒'} ${emoji} **${name}**: ${how}`),
+          footer: `${p}mm achievements @user to see someone else's · ${p}mm stats for the full record`,
+        }));
       }
       if (sub === 'top' || sub === 'leaderboard' || sub === 'lb') {
         const by = ['wins', 'kills', 'convictions', 'games'].includes(args[1]) ? args[1] : 'wins';

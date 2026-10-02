@@ -30,7 +30,7 @@ async function sendArt(channel, text, render, name = 'mystery.png') {
   if (!buffer && !text) return null;
   return channel.send(buffer ? { content: text, files: [{ attachment: buffer, name }] } : text).catch(() => {});
 }
-const sayWithArt = (g, text, render, name) => sendArt(g.channel, text, render, name);
+const sayWithArt = (g, text, render, name) => (g.stopped ? null : sendArt(g.channel, text, render, name));
 const weaponsOf = (g) => [...WEAPONS, ...(g.setting.weapons ?? [])];
 const capitalize = (t) => t.charAt(0).toUpperCase() + t.slice(1);
 // A dead guest's will, on parchment (skipped when the killer burned it).
@@ -68,7 +68,7 @@ const label = (p) => `**${p.char.name}** (${p.user.username})`;
 const plain = (p) => `${p.char.name} (${p.user.username})`;
 const alive = (g) => g.players.filter((p) => p.alive);
 const byId = (g, id) => g.players.find((p) => p.id === id);
-const say = (g, text) => g.channel.send(text).catch(() => {});
+const say = (g, text) => (g.stopped ? null : g.channel.send(text).catch(() => {}));
 const secs = (ms) => `${Math.round(ms / 1000)}s`;
 const team = (p) => ROLES[p.role].team;
 const isMurderTeam = (p) => team(p) === 'murderers';
@@ -243,13 +243,20 @@ function stats(userId) {
   return s;
 }
 
+// Ends a game for good. Phases check g.stopped after every wait, so a stopped game can't keep running in
+// the background (it used to, posting votes and nights next to the new game). Only touches state that
+// still belongs to this game, so an old game finishing late can't wipe out a newer one in the same GC.
 function cleanup(g) {
+  g.stopped = true;
   g.phase = 'over';
   if (g.waiter) g.waiter.done();
-  games.delete(g.channel.id);
-  if (party.channelGame(g.channel) === NAME) party.releaseChannel(g.channel);
+  if (games.get(g.channel.id) === g) {
+    games.delete(g.channel.id);
+    if (party.channelGame(g.channel) === NAME) party.releaseChannel(g.channel);
+  }
   for (const p of g.players) {
-    if (playerGame.get(p.id) === g) playerGame.delete(p.id);
+    if (playerGame.get(p.id) !== g) continue;
+    playerGame.delete(p.id);
     party.unlockPlayer(p.id, NAME);
   }
   // Bets that never got settled (game stopped or crashed) are refunded.
@@ -553,6 +560,7 @@ async function nightPhase(g) {
 
   const done = () => actors().every((p) => (p.role === 'murderer' ? g.night.kill : g.night.acted.has(p.id)));
   await waitFor(g, done, nightMs);
+  if (g.stopped) return;
   g.phase = 'resolving';
   const n = g.night;
 
@@ -775,6 +783,7 @@ async function votePhase(g) {
   g.votes = new Map();
   g.voteMsg = await g.channel.send(voteBoard(g));
   await waitFor(g, () => g.votes.size >= alive(g).length, pace(g, T.vote()));
+  if (g.stopped) return;
   g.phase = 'resolving';
   await g.voteMsg.edit(voteBoard(g, true)).catch(() => {});
 
@@ -803,6 +812,7 @@ async function trialPhase(g, accused, board = null) {
   const onTrial = `### ⚖️ ${accused.char.name} is on trial!\n> <@${accused.id}>, you have **${secs(pace(g, T.defense()))}** to defend yourself. Everyone else: listen.`;
   if (board) await sayWithArt(g, onTrial, board, `accusations-${g.day}.png`); else await say(g, onTrial);
   await waitFor(g, () => false, pace(g, T.defense()));
+  if (g.stopped) return;
   g.phase = 'trial';
   g.trialMsg = await g.channel.send(trialBoard(g).text);
   // Plain "guilty" / "innocent" messages count too (no prefix needed during a trial).
@@ -815,6 +825,7 @@ async function trialPhase(g, accused, board = null) {
   })().catch(() => {});
   await waitFor(g, () => g.trial.votes.size >= alive(g).length - 1, pace(g, T.trial()));
   open = false;
+  if (g.stopped) return;
   g.phase = 'resolving';
   const { guilty, innocent, text } = trialBoard(g, true);
   await g.trialMsg.edit(text).catch(() => {});
@@ -913,6 +924,7 @@ function earnedAchievements(g, p, side, winners) {
 }
 
 async function finale(g, side) {
+  if (g.stopped) return;
   g.phase = 'over';
   const winners = g.players.filter((p) => (side === 'town' ? team(p) === 'town' : team(p) === 'murderers'));
   if (g.jesterWinner) winners.push(g.jesterWinner);
@@ -1001,7 +1013,7 @@ function timelineRounds(g) {
 async function runGame(g) {
   try {
     await readyPhase(g);
-    if (g.phase === 'over') return;
+    if (g.stopped || g.phase === 'over') return;
     if (g.players.length < T.min()) {
       await say(g, `### 🎭 Game cancelled\n> Only ${g.players.length} player${g.players.length === 1 ? '' : 's'} DMed me. Need at least ${T.min()}.`);
       return;
@@ -1013,14 +1025,14 @@ async function runGame(g) {
       // The murderer always gets a night before the first vote.
       await nightPhase(g);
       let w = winner(g);
-      if (w) return finale(g, w);
-      if (g.phase === 'over') return;
+      if (w) return await finale(g, w); // await: cleanup in finally must wait for the finale to finish posting
+      if (g.stopped || g.phase === 'over') return;
       await dayPhase(g);
-      if (g.phase === 'over') return;
+      if (g.stopped || g.phase === 'over') return;
       await votePhase(g);
-      if (g.phase === 'over') return;
+      if (g.stopped || g.phase === 'over') return;
       w = winner(g);
-      if (w) return finale(g, w);
+      if (w) return await finale(g, w); // await: cleanup in finally must wait for the finale to finish posting
     }
   } catch (err) {
     console.error('[mystery]', err);

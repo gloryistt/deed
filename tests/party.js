@@ -493,6 +493,24 @@ module.exports = async function partyTests(h) {
     await say(alice, '!mm stop');
     await until(() => !mm.games.has(h.channel.id), 3000);
     check('mm: unsettled bets refunded when stopped', eco.balance(hank.id) === hank0, `${eco.balance(hank.id) - hank0}`);
+    // A game stopped mid-night must not keep running next to a new one (it used to: votes went nowhere).
+    await say(alice, '!mm');
+    for (const u of [bob, carol, dave]) await say(u, '!mm join');
+    const gOld = mm.games.get(h.channel.id);
+    gOld.forceRoles = ['murderer', 'guest', 'guest', 'guest'];
+    await say(alice, '!mm start');
+    for (const u of [alice, bob, carol, dave]) await dmTo(u, 'ready');
+    await until(() => gOld.phase === 'night', 5000);
+    await say(alice, '!mm stop');
+    await settle(200);
+    await say(alice, '!mm');
+    for (const u of [bob, carol, dave]) await say(u, '!mm join');
+    const gNew = mm.games.get(h.channel.id);
+    const from = h.log.length;
+    await settle(4000); // longer than the old game's night
+    check('mm: a stopped game stays stopped', gOld.stopped && gNew && gNew !== gOld && mm.games.get(h.channel.id) === gNew
+      && !h.log.slice(from).some((m) => /Morning|Who should stand trial|is dead/.test(m.content)), h.log.slice(from).map((m) => m.content.split('\n')[0]).join(' | '));
+    await say(alice, '!mm stop');
     r = await say(alice, '!mm cast clear');
     check('mm cast: clear', /cleared/.test(r), r);
     Object.assign(process.env, saved);
